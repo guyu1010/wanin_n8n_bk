@@ -488,8 +488,13 @@ class N8nMonitor:
         with open(hash_file, 'w', encoding='utf-8') as f:
             json.dump(new_hashes, f, indent=2)
 
+        # 儲存 workflow 資料時也要 sanitize（避免敏感資訊外洩）
+        sanitized_workflows = {}
+        for workflow_id, workflow_data in new_workflows.items():
+            sanitized_workflows[workflow_id] = self.sanitize_workflow(workflow_data)
+
         with open(data_file, 'w', encoding='utf-8') as f:
-            json.dump(new_workflows, f, indent=2, ensure_ascii=False)
+            json.dump(sanitized_workflows, f, indent=2, ensure_ascii=False)
 
         result['changed_count'] = len(changed_workflows)
         result['changed_workflows'] = changed_workflows
