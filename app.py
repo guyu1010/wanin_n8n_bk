@@ -341,13 +341,33 @@ class N8nMonitor:
 
                 except subprocess.CalledProcessError as e:
                     # 如果是第一次 push，需要設定 upstream
-                    if 'no upstream branch' in e.stderr:
+                    if 'no upstream branch' in e.stderr or 'src refspec main does not match any' in e.stderr:
                         self.logger.info("偵測到首次推送，執行: git push --set-upstream origin main")
-                        push_result = subprocess.run(['git', 'push', '--set-upstream', 'origin', 'main'],
-                                     cwd=self.git_repo_path, check=True,
-                                     capture_output=True, text=True, encoding='utf-8')
-                        self.logger.info("✓ 成功推送到遠端")
-                        return True
+                        try:
+                            push_result = subprocess.run(['git', 'push', '--set-upstream', 'origin', 'main'],
+                                         cwd=self.git_repo_path, check=True,
+                                         capture_output=True, text=True, encoding='utf-8')
+                            self.logger.info("✓ 成功推送到遠端")
+                            return True
+                        except subprocess.CalledProcessError as push_error:
+                            # 如果遠端是全新的空倉庫，可能需要先 pull
+                            if 'couldn\'t find remote ref' in push_error.stderr or 'does not match any' in push_error.stderr:
+                                self.logger.warning("⚠️ 遠端倉庫可能有預設文件，嘗試先拉取")
+                                try:
+                                    subprocess.run(['git', 'pull', 'origin', 'main', '--allow-unrelated-histories'],
+                                                 cwd=self.git_repo_path, check=True,
+                                                 capture_output=True, text=True, encoding='utf-8')
+                                    self.logger.info("✓ 成功拉取遠端文件")
+                                    continue  # 重試 push
+                                except subprocess.CalledProcessError:
+                                    # 遠端真的是空的，強制推送
+                                    self.logger.info("遠端為空，執行首次推送")
+                                    push_result = subprocess.run(['git', 'push', '-u', 'origin', 'main'],
+                                                 cwd=self.git_repo_path, check=True,
+                                                 capture_output=True, text=True, encoding='utf-8')
+                                    self.logger.info("✓ 成功推送到遠端")
+                                    return True
+                            raise
 
                     # 如果被拒絕（遠端有更新），先 pull 再 push
                     elif 'rejected' in e.stderr or 'fetch first' in e.stderr:
