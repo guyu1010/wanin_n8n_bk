@@ -505,21 +505,37 @@ class N8nMonitor:
             # 檢查是否有變更
             if workflow['id'] not in old_hashes or old_hashes[workflow['id']] != current_hash:
                 workflow_name = workflow['name']
-                self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
 
                 # 分析變更（如果有舊版本）
                 if workflow['id'] in old_workflows:
                     changes = self._analyze_workflow_changes(old_workflows[workflow['id']], detail)
-                    change_summary = self._format_change_summary(changes)
-                    self.logger.info(f"  {change_summary}")
-                    result['workflow_changes'][workflow_name] = change_summary
+
+                    # 檢查是否有實質變更（非僅位置改變）
+                    has_real_changes = (
+                        len(changes['added_nodes']) > 0 or
+                        len(changes['modified_nodes']) > 0 or
+                        len(changes['removed_nodes']) > 0
+                    )
+
+                    if has_real_changes:
+                        # 有實質變更，記錄並備份
+                        change_summary = self._format_change_summary(changes)
+                        self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
+                        self.logger.info(f"  {change_summary}")
+                        result['workflow_changes'][workflow_name] = change_summary
+
+                        self.save_workflow(detail)
+                        changed_workflows.append(workflow_name)
+                    # 如果沒有實質變更，靜默跳過（不記錄日誌，不備份）
+
                 else:
                     # 新建立的 workflow
+                    self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
                     result['workflow_changes'][workflow_name] = "🆕 新建立的工作流程"
                     self.logger.info(f"  🆕 新建立的工作流程")
 
-                self.save_workflow(detail)
-                changed_workflows.append(workflow_name)
+                    self.save_workflow(detail)
+                    changed_workflows.append(workflow_name)
 
         # 儲存新的 hash 和資料
         with open(hash_file, 'w', encoding='utf-8') as f:
