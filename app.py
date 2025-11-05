@@ -307,7 +307,9 @@ class N8nMonitor:
                 self.logger.info("沒有需要提交的變更")
                 return True
 
-            self.logger.info(f"偵測到變更檔案:\n{status.stdout}")
+            # 統計變更數量（不顯示詳細列表）
+            changed_files = [line for line in status.stdout.strip().split('\n') if line.strip()]
+            self.logger.info(f"偵測到 {len(changed_files)} 個檔案變更")
 
             # 建立 commit message
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
