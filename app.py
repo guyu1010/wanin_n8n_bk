@@ -236,7 +236,7 @@ class N8nMonitor:
         return filepath
     
     def git_commit_and_push(self, changed_workflows: List[str]) -> bool:
-        """提交變更到 Git"""
+        """提交變更到 Git（含重試機制）"""
         try:
             self.logger.info("=" * 50)
             self.logger.info("開始執行 Git 操作")
@@ -245,13 +245,13 @@ class N8nMonitor:
             self.logger.info(f"執行: git add . (在目錄: {self.git_repo_path})")
             result = subprocess.run(['git', 'add', '.'],
                          cwd=self.git_repo_path, check=True,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding='utf-8')
 
             # 檢查是否有變更
             self.logger.info("檢查 git status...")
             status = subprocess.run(['git', 'status', '--porcelain'],
                                   cwd=self.git_repo_path, check=True,
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, encoding='utf-8')
 
             if not status.stdout.strip():
                 self.logger.info("沒有需要提交的變更")
@@ -268,33 +268,76 @@ class N8nMonitor:
             self.logger.info("執行: git commit")
             subprocess.run(['git', 'commit', '-m', commit_msg],
                          cwd=self.git_repo_path, check=True,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, encoding='utf-8')
             self.logger.info("✓ Commit 成功")
 
-            # 執行 push（首次需要設定 upstream）
-            self.logger.info("執行: git push")
-            try:
-                push_result = subprocess.run(['git', 'push'],
-                             cwd=self.git_repo_path, check=True,
-                             capture_output=True, text=True)
-            except subprocess.CalledProcessError as e:
-                # 如果是第一次 push，需要設定 upstream
-                if 'no upstream branch' in e.stderr:
-                    self.logger.info("偵測到首次推送，執行: git push --set-upstream origin main")
-                    push_result = subprocess.run(['git', 'push', '--set-upstream', 'origin', 'main'],
+            # 執行 push（含重試機制）
+            max_push_retries = 3
+            for retry in range(max_push_retries):
+                try:
+                    self.logger.info(f"執行: git push (嘗試 {retry + 1}/{max_push_retries})")
+                    push_result = subprocess.run(['git', 'push'],
                                  cwd=self.git_repo_path, check=True,
-                                 capture_output=True, text=True)
-                else:
-                    raise
+                                 capture_output=True, text=True, encoding='utf-8')
 
-            if push_result.stdout:
-                self.logger.info(f"Push 輸出: {push_result.stdout}")
-            if push_result.stderr:
-                self.logger.info(f"Push 訊息: {push_result.stderr}")
+                    if push_result.stdout:
+                        self.logger.info(f"Push 輸出: {push_result.stdout}")
+                    if push_result.stderr:
+                        self.logger.info(f"Push 訊息: {push_result.stderr}")
 
-            self.logger.info(f"✓ 成功提交並推送 {len(changed_workflows)} 個工作流程到 Git")
-            self.logger.info("=" * 50)
-            return True
+                    self.logger.info(f"✓ 成功提交並推送 {len(changed_workflows)} 個工作流程到 Git")
+                    self.logger.info("=" * 50)
+                    return True
+
+                except subprocess.CalledProcessError as e:
+                    # 如果是第一次 push，需要設定 upstream
+                    if 'no upstream branch' in e.stderr:
+                        self.logger.info("偵測到首次推送，執行: git push --set-upstream origin main")
+                        push_result = subprocess.run(['git', 'push', '--set-upstream', 'origin', 'main'],
+                                     cwd=self.git_repo_path, check=True,
+                                     capture_output=True, text=True, encoding='utf-8')
+                        self.logger.info("✓ 成功推送到遠端")
+                        return True
+
+                    # 如果被拒絕（遠端有更新），先 pull 再 push
+                    elif 'rejected' in e.stderr or 'fetch first' in e.stderr:
+                        self.logger.warning("⚠️ 推送被拒絕，遠端有更新")
+                        self.logger.info("執行: git pull --rebase")
+
+                        try:
+                            # 先 pull 並 rebase
+                            pull_result = subprocess.run(['git', 'pull', '--rebase', 'origin', 'main'],
+                                         cwd=self.git_repo_path, check=True,
+                                         capture_output=True, text=True, encoding='utf-8')
+                            self.logger.info("✓ 成功拉取並 rebase 遠端變更")
+
+                            # 繼續下一輪重試
+                            continue
+
+                        except subprocess.CalledProcessError as pull_error:
+                            self.logger.error(f"✗ Pull 失敗: {pull_error.stderr}")
+
+                            # 檢查是否有衝突
+                            if 'conflict' in pull_error.stderr.lower():
+                                self.logger.error("偵測到合併衝突，嘗試中止 rebase")
+                                subprocess.run(['git', 'rebase', '--abort'],
+                                             cwd=self.git_repo_path,
+                                             capture_output=True, text=True, encoding='utf-8')
+                                return False
+                            raise
+
+                    # 其他錯誤
+                    elif retry < max_push_retries - 1:
+                        wait_time = 2 ** retry  # 指數退避: 1s, 2s, 4s
+                        self.logger.warning(f"Push 失敗，{wait_time} 秒後重試...")
+                        time.sleep(wait_time)
+                    else:
+                        # 最後一次重試失敗
+                        raise
+
+            # 如果所有重試都失敗
+            self.logger.error("已達最大重試次數，推送失敗")
+            return False
 
         except subprocess.CalledProcessError as e:
             self.logger.error("=" * 50)
@@ -407,8 +450,8 @@ class N8nMonitor:
                     }]
                 }
             elif platform == 'teams':
-                # Power Automate 使用簡單的 JSON，在 Flow 中建立卡片
-                payload = self._create_teams_payload(data)
+                # 建立完整的 Adaptive Card 結構
+                payload = self._create_teams_card(data)
             else:  # generic
                 payload = data
 
