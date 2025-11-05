@@ -450,8 +450,8 @@ class N8nMonitor:
                     }]
                 }
             elif platform == 'teams':
-                # Power Automate 使用簡單的 JSON，在 Flow 中建立卡片
-                payload = self._create_teams_payload(data)
+                # 建立完整的 Adaptive Card 結構
+                payload = self._create_teams_card(data)
             else:  # generic
                 payload = data
 
