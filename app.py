@@ -129,10 +129,26 @@ class N8nMonitor:
             return None
     
     def calculate_hash(self, workflow_data: Dict) -> str:
-        """計算工作流程的 hash 值"""
-        # 移除時間戳記等不影響邏輯的欄位
-        clean_data = {k: v for k, v in workflow_data.items()
-                     if k not in ['updatedAt', 'createdAt']}
+        """計算工作流程的 hash 值（僅關注功能性變更）"""
+        import copy
+
+        # 深拷貝避免修改原始資料
+        clean_data = copy.deepcopy(workflow_data)
+
+        # 移除不影響功能的欄位
+        ignored_fields = ['updatedAt', 'createdAt', 'versionId', 'id']
+        for field in ignored_fields:
+            clean_data.pop(field, None)
+
+        # 移除 nodes 中的位置資訊（位置改變不算功能變更）
+        if 'nodes' in clean_data:
+            for node in clean_data['nodes']:
+                node.pop('position', None)  # 節點座標
+                node.pop('id', None)  # 節點內部 ID（如果改變但 name 不變，不算變更）
+
+        # 移除 connections 的順序影響（使用 sorted）
+        # connections 的邏輯相同但順序不同，不算變更
+
         content = json.dumps(clean_data, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()
 
