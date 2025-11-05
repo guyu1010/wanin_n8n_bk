@@ -352,14 +352,18 @@ class N8nMonitor:
                     # 如果被拒絕（遠端有更新），先 pull 再 push
                     elif 'rejected' in e.stderr or 'fetch first' in e.stderr:
                         self.logger.warning("⚠️ 推送被拒絕，遠端有更新")
-                        self.logger.info("執行: git pull --rebase")
+                        self.logger.info("執行: git pull (使用 merge 策略，衝突時優先採用遠端版本)")
 
                         try:
-                            # 先 pull 並 rebase
-                            pull_result = subprocess.run(['git', 'pull', '--rebase', 'origin', 'main'],
-                                         cwd=self.git_repo_path, check=True,
-                                         capture_output=True, text=True, encoding='utf-8')
-                            self.logger.info("✓ 成功拉取並 rebase 遠端變更")
+                            # 使用 merge 策略，衝突時自動選擇遠端版本
+                            pull_result = subprocess.run([
+                                'git', 'pull', '--no-rebase',
+                                '-X', 'theirs',  # 衝突時選擇遠端版本
+                                'origin', 'main'
+                            ], cwd=self.git_repo_path, check=True,
+                               capture_output=True, text=True, encoding='utf-8')
+
+                            self.logger.info("✓ 成功拉取並合併遠端變更")
 
                             # 繼續下一輪重試
                             continue
@@ -367,14 +371,20 @@ class N8nMonitor:
                         except subprocess.CalledProcessError as pull_error:
                             self.logger.error(f"✗ Pull 失敗: {pull_error.stderr}")
 
-                            # 檢查是否有衝突
-                            if 'conflict' in pull_error.stderr.lower():
-                                self.logger.error("偵測到合併衝突，嘗試中止 rebase")
-                                subprocess.run(['git', 'rebase', '--abort'],
-                                             cwd=self.git_repo_path,
+                            # 如果 merge 也失敗，嘗試重置到遠端狀態
+                            self.logger.warning("⚠️ 嘗試重置到遠端最新狀態")
+                            try:
+                                subprocess.run(['git', 'fetch', 'origin', 'main'],
+                                             cwd=self.git_repo_path, check=True,
                                              capture_output=True, text=True, encoding='utf-8')
+                                subprocess.run(['git', 'reset', '--hard', 'origin/main'],
+                                             cwd=self.git_repo_path, check=True,
+                                             capture_output=True, text=True, encoding='utf-8')
+                                self.logger.info("✓ 已重置到遠端最新狀態")
+                                return False  # 本次推送放棄，下次會重新備份
+                            except subprocess.CalledProcessError:
+                                self.logger.error("✗ 無法重置到遠端狀態")
                                 return False
-                            raise
 
                     # 其他錯誤
                     elif retry < max_push_retries - 1:
