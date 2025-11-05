@@ -137,33 +137,27 @@ class N8nMonitor:
         return hashlib.sha256(content.encode()).hexdigest()
 
     def _analyze_workflow_changes(self, old_workflow: Dict, new_workflow: Dict) -> Dict:
-        """分析工作流程的變更（簡化版）"""
+        """分析工作流程的變更"""
         changes = {
             'added_nodes': [],
             'removed_nodes': [],
             'modified_nodes': []
         }
 
-        # 取得新舊節點
         old_nodes = {node['id']: node for node in old_workflow.get('nodes', [])}
         new_nodes = {node['id']: node for node in new_workflow.get('nodes', [])}
 
-        # 找出新增的節點
         for node_id, node in new_nodes.items():
             if node_id not in old_nodes:
                 changes['added_nodes'].append(f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})")
 
-        # 找出刪除的節點
         for node_id, node in old_nodes.items():
             if node_id not in new_nodes:
                 changes['removed_nodes'].append(f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})")
 
-        # 找出修改的節點（簡化：只比對 name, type, parameters）
         for node_id in set(old_nodes.keys()) & set(new_nodes.keys()):
             old_node = old_nodes[node_id]
             new_node = new_nodes[node_id]
-
-            # 比對關鍵欄位
             if (old_node.get('name') != new_node.get('name') or
                 old_node.get('type') != new_node.get('type') or
                 old_node.get('parameters') != new_node.get('parameters')):
@@ -547,39 +541,6 @@ class N8nMonitor:
 
         except Exception as e:
             self.logger.error(f"發送 Webhook 失敗: {e}")
-
-    def _create_teams_payload(self, data: Dict) -> Dict:
-        """創建給 Power Automate 的簡單 JSON payload"""
-        status = data.get('status', 'info')
-        title = data.get('title', 'n8n 監控通知')
-
-        # 基本 payload
-        payload = {
-            'title': title,
-            'status': status,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'n8n_url': self.n8n_url
-        }
-
-        # 根據不同類型添加資料
-        if 'backup_result' in data:
-            result = data['backup_result']
-            payload.update({
-                'type': 'backup',
-                'total_count': result.get('total_count', 0),
-                'changed_count': result.get('changed_count', 0),
-                'changed_workflows': result.get('changed_workflows', []),
-                'github_url': 'https://github.com/guyu1010/wanin_n8n_bk_data'
-            })
-        elif 'health_status' in data:
-            health = data['health_status']
-            payload.update({
-                'type': 'health',
-                'health_status': health.get('status', 'unknown'),
-                'error': health.get('error', '')
-            })
-
-        return payload
 
     def _create_teams_card(self, data: Dict) -> Dict:
         """創建 Microsoft Teams Adaptive Card"""
