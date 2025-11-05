@@ -4,7 +4,7 @@
     "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkM2U3OTU1YS1mZDJkLTQ4ODctODBkOC1mYTA1M2EwMGY4M2YiLCJpc3MiOiJuOG4iLCJhdWQiOiJwdWJsaWMtYXBpIiwiaWF0IjoxNzYyMjQ3NzU2fQ.uXm_N0l_47mgUgzAq_Uw8fqcuJan2brOaSr-CexSjcA"
   },
   "git": {
-    "repo_path": "e:/n8n/backup"
+    "repo_path": "./backup"
   },
   "timeout": 10,
   "max_retries": 3,
