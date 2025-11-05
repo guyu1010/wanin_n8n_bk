@@ -375,11 +375,11 @@ class N8nMonitor:
         webhook_config = self.notifications.get('webhook', {})
         if not webhook_config.get('enabled', False):
             return
-        
+
         try:
             # 根據不同平台格式化訊息
             platform = webhook_config.get('platform', 'generic')
-            
+
             if platform == 'slack':
                 payload = {
                     'text': data.get('message', ''),
@@ -399,9 +399,12 @@ class N8nMonitor:
                         'color': 15158332 if data.get('status') == 'error' else 3066993
                     }]
                 }
+            elif platform == 'teams':
+                # Power Automate 使用簡單的 JSON，在 Flow 中建立卡片
+                payload = self._create_teams_payload(data)
             else:  # generic
                 payload = data
-            
+
             response = requests.post(
                 webhook_config['url'],
                 json=payload,
@@ -409,40 +412,195 @@ class N8nMonitor:
             )
             response.raise_for_status()
             self.logger.info("✓ Webhook 通知已發送")
-            
+
         except Exception as e:
             self.logger.error(f"發送 Webhook 失敗: {e}")
-    
+
+    def _create_teams_payload(self, data: Dict) -> Dict:
+        """創建給 Power Automate 的簡單 JSON payload"""
+        status = data.get('status', 'info')
+        title = data.get('title', 'n8n 監控通知')
+
+        # 基本 payload
+        payload = {
+            'title': title,
+            'status': status,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'n8n_url': self.n8n_url
+        }
+
+        # 根據不同類型添加資料
+        if 'backup_result' in data:
+            result = data['backup_result']
+            payload.update({
+                'type': 'backup',
+                'total_count': result.get('total_count', 0),
+                'changed_count': result.get('changed_count', 0),
+                'changed_workflows': result.get('changed_workflows', []),
+                'github_url': 'https://github.com/guyu1010/wanin_n8n_bk_data'
+            })
+        elif 'health_status' in data:
+            health = data['health_status']
+            payload.update({
+                'type': 'health',
+                'health_status': health.get('status', 'unknown'),
+                'error': health.get('error', '')
+            })
+
+        return payload
+
+    def _create_teams_card(self, data: Dict) -> Dict:
+        """創建 Microsoft Teams Adaptive Card"""
+        status = data.get('status', 'info')
+        title = data.get('title', 'n8n 監控通知')
+
+        # 根據狀態設定顏色和圖示
+        if status == 'error':
+            color = 'Attention'  # 紅色
+            icon = '⚠️'
+        elif status == 'success':
+            color = 'Good'  # 綠色
+            icon = '✅'
+        else:
+            color = 'Default'  # 灰色
+            icon = 'ℹ️'
+
+        # 基本卡片結構
+        card = {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "type": "AdaptiveCard",
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "version": "1.4",
+                        "body": [
+                            {
+                                "type": "TextBlock",
+                                "text": f"{icon} {title}",
+                                "size": "Large",
+                                "weight": "Bolder",
+                                "color": color
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        body = card["attachments"][0]["content"]["body"]
+
+        # 根據不同的通知類型添加內容
+        if 'backup_result' in data:
+            # 備份完成通知
+            result = data['backup_result']
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+            # 添加時間和統計資訊
+            body.append({
+                "type": "FactSet",
+                "facts": [
+                    {"title": "⏰ 備份時間", "value": timestamp},
+                    {"title": "📊 總流程數", "value": str(result.get('total_count', 0))},
+                    {"title": "✏️ 本次變更", "value": str(result.get('changed_count', 0))}
+                ]
+            })
+
+            # 如果有變更，顯示變更列表
+            if result.get('changed_workflows'):
+                body.append({
+                    "type": "TextBlock",
+                    "text": "**變更的工作流程：**",
+                    "weight": "Bolder",
+                    "spacing": "Medium"
+                })
+
+                for workflow_name in result['changed_workflows']:
+                    body.append({
+                        "type": "TextBlock",
+                        "text": f"• {workflow_name}",
+                        "spacing": "Small"
+                    })
+
+            # 添加連結按鈕
+            card["attachments"][0]["content"]["actions"] = [
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "開啟 n8n",
+                    "url": self.n8n_url
+                },
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "查看備份",
+                    "url": "https://github.com/guyu1010/wanin_n8n_bk_data"
+                }
+            ]
+
+        elif 'health_status' in data:
+            # 健康狀態變更通知
+            health = data['health_status']
+
+            body.append({
+                "type": "FactSet",
+                "facts": [
+                    {"title": "⏰ 時間", "value": health.get('timestamp', '')},
+                    {"title": "📍 狀態", "value": health.get('status', 'unknown')}
+                ]
+            })
+
+            # 如果有錯誤訊息
+            if 'error' in health:
+                body.append({
+                    "type": "TextBlock",
+                    "text": f"**錯誤訊息：**\n{health['error']}",
+                    "wrap": True,
+                    "spacing": "Medium",
+                    "color": "Attention"
+                })
+
+            # 添加連結按鈕
+            card["attachments"][0]["content"]["actions"] = [
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "檢查 n8n",
+                    "url": self.n8n_url
+                }
+            ]
+        else:
+            # 一般訊息
+            message = data.get('message', '')
+            body.append({
+                "type": "TextBlock",
+                "text": message,
+                "wrap": True
+            })
+
+        return card
+
     def handle_health_change(self, health_status: Dict):
         """處理健康狀態變更"""
         current_status = health_status['status']
-        
+
         # 如果狀態改變,發送通知
         if self.last_health_status != current_status:
             if current_status != 'healthy':
                 # n8n 出現問題
-                message = f"⚠️ n8n 服務異常!\n\n"
-                message += f"狀態: {current_status}\n"
-                message += f"時間: {health_status['timestamp']}\n"
-                if 'error' in health_status:
-                    message += f"錯誤: {health_status['error']}\n"
-                
-                self.logger.error(message)
+                self.logger.error(f"n8n 服務異常: {current_status}")
                 self.send_webhook_notification({
                     'title': 'n8n 服務異常',
-                    'message': message,
-                    'status': 'error'
+                    'status': 'error',
+                    'health_status': health_status
                 })
             else:
                 # n8n 恢復正常
-                message = f"✅ n8n 服務已恢復正常\n\n時間: {health_status['timestamp']}"
-                self.logger.info(message)
+                self.logger.info("n8n 服務已恢復正常")
                 self.send_webhook_notification({
                     'title': 'n8n 服務恢復',
-                    'message': message,
-                    'status': 'success'
+                    'status': 'success',
+                    'health_status': health_status
                 })
-            
+
             self.last_health_status = current_status
     
     def run(self):
@@ -456,18 +614,12 @@ class N8nMonitor:
         # 2. 如果 n8n 正常,執行備份
         if health_status['status'] == 'healthy':
             backup_result = self.backup_workflows()
-            
+
             if backup_result['changed_count'] > 0:
-                message = f"📦 n8n 工作流程備份完成\n\n"
-                message += f"總數: {backup_result['total_count']}\n"
-                message += f"變更: {backup_result['changed_count']}\n\n"
-                message += "變更的工作流程:\n"
-                message += "\n".join(f"- {name}" for name in backup_result['changed_workflows'])
-                
                 self.send_webhook_notification({
-                    'title': 'n8n 備份完成',
-                    'message': message,
-                    'status': 'success'
+                    'title': 'n8n 工作流程備份完成',
+                    'status': 'success',
+                    'backup_result': backup_result
                 })
         else:
             self.logger.warning("由於 n8n 服務異常,跳過備份作業")

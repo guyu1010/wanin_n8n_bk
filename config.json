@@ -10,9 +10,9 @@
   "max_retries": 3,
   "notifications": {
     "webhook": {
-      "enabled": false,
-      "platform": "discord",
-      "url": "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
+      "enabled": true,
+      "platform": "teams",
+      "url": "https://defaulte3b1206d4933459eb11acd1f3e7cd4.4c.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/ac35a05797ef4795b4569bc383e54b4c/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=Pu-DWReQgFY5H5QS-dN4cIgoenIQINFq5U1FrabCeqE"
     }
   }
 }
