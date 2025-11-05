@@ -131,11 +131,67 @@ class N8nMonitor:
     def calculate_hash(self, workflow_data: Dict) -> str:
         """計算工作流程的 hash 值"""
         # 移除時間戳記等不影響邏輯的欄位
-        clean_data = {k: v for k, v in workflow_data.items() 
+        clean_data = {k: v for k, v in workflow_data.items()
                      if k not in ['updatedAt', 'createdAt']}
         content = json.dumps(clean_data, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()
-    
+
+    def _analyze_workflow_changes(self, old_workflow: Dict, new_workflow: Dict) -> Dict:
+        """分析工作流程的變更（簡化版）"""
+        changes = {
+            'added_nodes': [],
+            'removed_nodes': [],
+            'modified_nodes': []
+        }
+
+        # 取得新舊節點
+        old_nodes = {node['id']: node for node in old_workflow.get('nodes', [])}
+        new_nodes = {node['id']: node for node in new_workflow.get('nodes', [])}
+
+        # 找出新增的節點
+        for node_id, node in new_nodes.items():
+            if node_id not in old_nodes:
+                changes['added_nodes'].append(f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})")
+
+        # 找出刪除的節點
+        for node_id, node in old_nodes.items():
+            if node_id not in new_nodes:
+                changes['removed_nodes'].append(f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})")
+
+        # 找出修改的節點（簡化：只比對 name, type, parameters）
+        for node_id in set(old_nodes.keys()) & set(new_nodes.keys()):
+            old_node = old_nodes[node_id]
+            new_node = new_nodes[node_id]
+
+            # 比對關鍵欄位
+            if (old_node.get('name') != new_node.get('name') or
+                old_node.get('type') != new_node.get('type') or
+                old_node.get('parameters') != new_node.get('parameters')):
+                changes['modified_nodes'].append(f"{new_node.get('name', 'Unknown')} ({new_node.get('type', 'Unknown').split('.')[-1]})")
+
+        return changes
+
+    def _format_change_summary(self, changes: Dict) -> str:
+        """格式化變更摘要為簡潔文字"""
+        summary_parts = []
+
+        if changes['added_nodes']:
+            summary_parts.append(f"🆕 新增 {len(changes['added_nodes'])} 個節點: {', '.join(changes['added_nodes'][:3])}")
+            if len(changes['added_nodes']) > 3:
+                summary_parts[-1] += f" 等 {len(changes['added_nodes'])} 個"
+
+        if changes['modified_nodes']:
+            summary_parts.append(f"✏️ 修改 {len(changes['modified_nodes'])} 個節點: {', '.join(changes['modified_nodes'][:3])}")
+            if len(changes['modified_nodes']) > 3:
+                summary_parts[-1] += f" 等 {len(changes['modified_nodes'])} 個"
+
+        if changes['removed_nodes']:
+            summary_parts.append(f"🗑️ 刪除 {len(changes['removed_nodes'])} 個節點: {', '.join(changes['removed_nodes'][:3])}")
+            if len(changes['removed_nodes']) > 3:
+                summary_parts[-1] += f" 等 {len(changes['removed_nodes'])} 個"
+
+        return '\n  '.join(summary_parts) if summary_parts else '無明顯變更'
+
     def sanitize_workflow(self, workflow: Dict) -> Dict:
         """清理工作流程中的敏感資訊"""
         import copy
@@ -358,56 +414,82 @@ class N8nMonitor:
         """執行工作流程備份"""
         self.logger.info("=" * 50)
         self.logger.info("開始備份工作流程")
-        
+
         result = {
             'success': False,
             'changed_count': 0,
             'total_count': 0,
             'changed_workflows': [],
+            'workflow_changes': {},  # 新增：儲存每個 workflow 的變更詳情
             'error': None
         }
-        
+
         # 取得所有工作流程
         workflows = self.get_all_workflows()
         if workflows is None:
             result['error'] = '無法取得工作流程列表'
             return result
-        
+
         result['total_count'] = len(workflows)
-        
-        # 載入上次的 hash 紀錄
+
+        # 載入上次的 hash 和完整資料
         hash_file = self.git_repo_path / '.workflow_hashes.json'
+        data_file = self.git_repo_path / '.workflow_data.json'
         old_hashes = {}
+        old_workflows = {}
+
         if hash_file.exists():
             with open(hash_file, 'r', encoding='utf-8') as f:
                 old_hashes = json.load(f)
-        
+
+        if data_file.exists():
+            with open(data_file, 'r', encoding='utf-8') as f:
+                old_workflows = json.load(f)
+
         new_hashes = {}
+        new_workflows = {}
         changed_workflows = []
-        
+
         # 處理每個工作流程
         for workflow in workflows:
             detail = self.get_workflow_detail(workflow['id'])
             if detail is None:
                 continue
-            
+
             # 計算 hash
             current_hash = self.calculate_hash(detail)
             new_hashes[workflow['id']] = current_hash
-            
+            new_workflows[workflow['id']] = detail
+
             # 檢查是否有變更
             if workflow['id'] not in old_hashes or old_hashes[workflow['id']] != current_hash:
-                self.logger.info(f"偵測到變更: {workflow['name']} (ID: {workflow['id']})")
+                workflow_name = workflow['name']
+                self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
+
+                # 分析變更（如果有舊版本）
+                if workflow['id'] in old_workflows:
+                    changes = self._analyze_workflow_changes(old_workflows[workflow['id']], detail)
+                    change_summary = self._format_change_summary(changes)
+                    self.logger.info(f"  {change_summary}")
+                    result['workflow_changes'][workflow_name] = change_summary
+                else:
+                    # 新建立的 workflow
+                    result['workflow_changes'][workflow_name] = "🆕 新建立的工作流程"
+                    self.logger.info(f"  🆕 新建立的工作流程")
+
                 self.save_workflow(detail)
-                changed_workflows.append(workflow['name'])
-        
-        # 儲存新的 hash 紀錄
+                changed_workflows.append(workflow_name)
+
+        # 儲存新的 hash 和資料
         with open(hash_file, 'w', encoding='utf-8') as f:
             json.dump(new_hashes, f, indent=2)
-        
+
+        with open(data_file, 'w', encoding='utf-8') as f:
+            json.dump(new_workflows, f, indent=2, ensure_ascii=False)
+
         result['changed_count'] = len(changed_workflows)
         result['changed_workflows'] = changed_workflows
-        
+
         # 如果有變更,提交到 Git
         if changed_workflows:
             if self.git_commit_and_push(changed_workflows):
@@ -417,7 +499,7 @@ class N8nMonitor:
         else:
             self.logger.info("沒有偵測到工作流程變更")
             result['success'] = True
-        
+
         return result
     
     def send_webhook_notification(self, data: Dict):
@@ -557,7 +639,7 @@ class N8nMonitor:
                 ]
             })
 
-            # 如果有變更，顯示變更列表
+            # 如果有變更，顯示變更列表和詳情
             if result.get('changed_workflows'):
                 body.append({
                     "type": "TextBlock",
@@ -566,12 +648,30 @@ class N8nMonitor:
                     "spacing": "Medium"
                 })
 
+                workflow_changes = result.get('workflow_changes', {})
                 for workflow_name in result['changed_workflows']:
+                    # 顯示工作流程名稱
                     body.append({
                         "type": "TextBlock",
-                        "text": f"• {workflow_name}",
-                        "spacing": "Small"
+                        "text": f"📝 **{workflow_name}**",
+                        "spacing": "Small",
+                        "weight": "Bolder"
                     })
+
+                    # 顯示變更摘要（如果有）
+                    if workflow_name in workflow_changes:
+                        change_summary = workflow_changes[workflow_name]
+                        # 將多行摘要分開顯示
+                        for line in change_summary.split('\n'):
+                            if line.strip():
+                                body.append({
+                                    "type": "TextBlock",
+                                    "text": f"  {line.strip()}",
+                                    "spacing": "None",
+                                    "size": "Small",
+                                    "isSubtle": True,
+                                    "wrap": True
+                                })
 
             # 添加連結按鈕
             card["attachments"][0]["content"]["actions"] = [
