@@ -780,7 +780,7 @@ class N8nMonitor:
 
             if backup_result['changed_count'] > 0:
                 self.send_webhook_notification({
-                    'title': 'n8n 工作流程備份完成',
+                    'title': 'n8n工作流程異動 - 備份完成',
                     'status': 'success',
                     'backup_result': backup_result
                 })
