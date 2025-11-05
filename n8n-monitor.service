@@ -1,0 +1,19 @@
+[Unit]
+Description=n8n Monitor and Backup Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/wanin_n8n_bk
+ExecStart=/usr/bin/python3 /home/user/wanin_n8n_bk/app.py
+Restart=always
+RestartSec=10
+
+# 日誌設定
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=n8n-monitor
+
+[Install]
+WantedBy=multi-user.target
