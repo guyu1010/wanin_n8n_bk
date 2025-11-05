@@ -2,7 +2,7 @@ import requests
 import json
 import subprocess
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
@@ -23,10 +23,17 @@ class N8nMonitor:
         self.n8n_url = config['n8n']['url'].rstrip('/')
         self.api_key = config['n8n']['api_key']
         self.git_repo_path = Path(config['git']['repo_path'])
-        
+
         # 通知設定
         self.notifications = config.get('notifications', {})
-        
+
+        # 排程設定
+        self.schedule_config = config.get('schedule', {
+            'enabled': False,
+            'interval': 600,
+            'run_on_startup': True
+        })
+
         # HTTP 請求設定
         self.headers = {
             'X-N8N-API-KEY': self.api_key,
@@ -627,6 +634,58 @@ class N8nMonitor:
         self.logger.info("監控與備份流程結束")
         self.logger.info("=" * 50)
 
+    def run_scheduled(self):
+        """執行排程模式 - 持續運行並定期執行監控與備份"""
+        interval = self.schedule_config.get('interval', 600)
+        run_on_startup = self.schedule_config.get('run_on_startup', True)
+
+        self.logger.info("=" * 50)
+        self.logger.info("🚀 n8n 監控系統啟動（排程模式）")
+        self.logger.info(f"⏱️  執行間隔: {interval} 秒 ({interval // 60} 分鐘)")
+        self.logger.info(f"🔄 啟動時執行: {'是' if run_on_startup else '否'}")
+        self.logger.info("=" * 50)
+
+        # 如果設定為啟動時執行，立即執行一次
+        if run_on_startup:
+            self.logger.info("⚡ 立即執行第一次監控...")
+            try:
+                self.run()
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                self.logger.error(f"執行時發生錯誤: {e}")
+
+        # 進入排程循環
+        try:
+            while True:
+                # 計算下次執行時間
+                next_run = datetime.now() + timedelta(seconds=interval)
+
+                self.logger.info(f"⏰ 下次執行時間: {next_run.strftime('%Y-%m-%d %H:%M:%S')} (等待 {interval} 秒)")
+                time.sleep(interval)
+
+                # 執行監控與備份
+                try:
+                    self.run()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    self.logger.error(f"執行時發生錯誤: {e}")
+
+        except KeyboardInterrupt:
+            self.logger.info("\n")
+            self.logger.info("=" * 50)
+            self.logger.info("⛔ 收到中斷訊號，正在停止監控系統...")
+            self.logger.info("=" * 50)
+
 if __name__ == '__main__':
+    import sys
+
     monitor = N8nMonitor('config.json')
-    monitor.run()
+
+    # 檢查是否啟用排程模式
+    if monitor.schedule_config.get('enabled', False):
+        monitor.run_scheduled()
+    else:
+        # 單次執行模式（兼容舊版使用方式）
+        monitor.run()

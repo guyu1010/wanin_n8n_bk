@@ -8,6 +8,11 @@
   },
   "timeout": 10,
   "max_retries": 3,
+  "schedule": {
+    "enabled": true,
+    "interval": 600,
+    "run_on_startup": true
+  },
   "notifications": {
     "webhook": {
       "enabled": true,
