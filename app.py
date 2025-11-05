@@ -144,7 +144,6 @@ class N8nMonitor:
         if 'nodes' in clean_data:
             for node in clean_data['nodes']:
                 node.pop('position', None)  # 節點座標
-                node.pop('id', None)  # 節點內部 ID（如果改變但 name 不變，不算變更）
 
         # 移除 connections 的順序影響（使用 sorted）
         # connections 的邏輯相同但順序不同，不算變更
