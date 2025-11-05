@@ -78,23 +78,6 @@ Teams 卡片將顯示：
   🗑️ 刪除 1 個節點: 舊處理器 (function)
 ```
 
-## 系統服務部署
-
-### 方式一：systemd 服務（推薦）
-
-```bash
-sudo cp n8n-monitor.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable n8n-monitor
-sudo systemctl start n8n-monitor
-```
-
-### 方式二：直接執行
-
-```bash
-python3 app.py
-```
-
 ## 配置說明
 
 | 參數 | 說明 | 預設值 |
@@ -137,11 +120,3 @@ python3 app.py
 - **備份格式**: JSON
 - **版本控制**: Git
 - **執行頻率**: 每半小時（00 分、30 分）
-
-## 授權
-
-MIT License
-
-## 貢獻
-
-歡迎提交 Issue 和 Pull Request！
