@@ -807,18 +807,19 @@ class N8nMonitor:
         self.logger.info("=" * 50)
 
     def run_scheduled(self):
-        """執行排程模式 - 在每小時的 00 分和 30 分執行"""
+        """執行排程模式 - 健康檢查 10 分鐘，備份 30 分鐘"""
         run_on_startup = self.schedule_config.get('run_on_startup', True)
 
         self.logger.info("=" * 50)
         self.logger.info("🚀 n8n 監控系統啟動（排程模式）")
-        self.logger.info("⏱️  執行時間: 每小時的 00 分和 30 分")
+        self.logger.info("⏱️  健康檢查: 每 10 分鐘")
+        self.logger.info("⏱️  備份執行: 每 30 分鐘（每小時的 00 分和 30 分）")
         self.logger.info(f"🔄 啟動時執行: {'是' if run_on_startup else '否'}")
         self.logger.info("=" * 50)
 
-        # 如果設定為啟動時執行，立即執行一次
+        # 如果設定為啟動時執行，立即執行一次完整流程
         if run_on_startup:
-            self.logger.info("⚡ 立即執行第一次監控...")
+            self.logger.info("⚡ 立即執行第一次監控與備份...")
             try:
                 self.run()
             except KeyboardInterrupt:
@@ -829,35 +830,44 @@ class N8nMonitor:
         # 進入排程循環
         try:
             while True:
-                # 計算下次執行時間（每小時的 00 分或 30 分）
                 now = datetime.now()
-                next_run = now.replace(second=0, microsecond=0)
 
-                # 決定下一個執行時間點
-                if now.minute < 30:
-                    # 下一個執行時間是本小時的 30 分
-                    next_run = next_run.replace(minute=30)
+                # 計算下次健康檢查時間（每 10 分鐘整數倍）
+                next_health_check = now.replace(second=0, microsecond=0)
+                current_minute = now.minute
+                next_check_minute = ((current_minute // 10) + 1) * 10
+
+                if next_check_minute >= 60:
+                    next_health_check = next_health_check.replace(minute=0) + timedelta(hours=1)
                 else:
-                    # 下一個執行時間是下一小時的 00 分
-                    next_run = next_run.replace(minute=0)
-                    next_run = next_run + timedelta(hours=1)
+                    next_health_check = next_health_check.replace(minute=next_check_minute)
 
-                # 如果計算出的時間已經過去（可能剛好在整點或半點），則跳到下一個時間點
-                if next_run <= now:
-                    if next_run.minute == 0:
-                        next_run = next_run.replace(minute=30)
-                    else:
-                        next_run = next_run.replace(minute=0) + timedelta(hours=1)
+                # 檢查是否為備份時間（00 或 30 分）
+                is_backup_time = (next_check_minute == 0 or next_check_minute == 30)
 
-                # 計算需要等待的秒數
-                wait_seconds = (next_run - datetime.now()).total_seconds()
+                # 計算等待時間
+                wait_seconds = (next_health_check - datetime.now()).total_seconds()
 
-                self.logger.info(f"⏰ 下次執行時間: {next_run.strftime('%Y-%m-%d %H:%M:%S')} (等待 {int(wait_seconds)} 秒)")
+                if is_backup_time:
+                    self.logger.info(f"⏰ 下次執行: {next_health_check.strftime('%Y-%m-%d %H:%M:%S')} [健康檢查 + 備份] (等待 {int(wait_seconds)} 秒)")
+                else:
+                    self.logger.info(f"⏰ 下次執行: {next_health_check.strftime('%Y-%m-%d %H:%M:%S')} [健康檢查] (等待 {int(wait_seconds)} 秒)")
+
                 time.sleep(wait_seconds)
 
-                # 執行監控與備份
+                # 執行任務
                 try:
-                    self.run()
+                    if is_backup_time:
+                        # 每 30 分鐘：執行完整的監控與備份
+                        self.run()
+                    else:
+                        # 每 10 分鐘：僅執行健康檢查
+                        self.logger.info("開始執行健康檢查")
+                        health_status = self.check_health()
+                        self.handle_health_change(health_status)
+                        self.logger.info("健康檢查結束")
+                        self.logger.info("=" * 50)
+
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
