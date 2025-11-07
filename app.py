@@ -807,13 +807,13 @@ class N8nMonitor:
         self.logger.info("=" * 50)
 
     def run_scheduled(self):
-        """執行排程模式 - 健康檢查 10 分鐘，備份 30 分鐘"""
+        """執行排程模式 - 健康檢查 10 分鐘，備份 60 分鐘"""
         run_on_startup = self.schedule_config.get('run_on_startup', True)
 
         self.logger.info("=" * 50)
         self.logger.info("🚀 n8n 監控系統啟動（排程模式）")
         self.logger.info("⏱️  健康檢查: 每 10 分鐘")
-        self.logger.info("⏱️  備份執行: 每 30 分鐘（每小時的 00 分和 30 分）")
+        self.logger.info("⏱️  備份執行: 每 60 分鐘（每小時的 00 分）")
         self.logger.info(f"🔄 啟動時執行: {'是' if run_on_startup else '否'}")
         self.logger.info("=" * 50)
 
@@ -842,8 +842,8 @@ class N8nMonitor:
                 else:
                     next_health_check = next_health_check.replace(minute=next_check_minute)
 
-                # 檢查是否為備份時間（00 或 30 分）
-                is_backup_time = (next_check_minute == 0 or next_check_minute == 30)
+                # 檢查是否為備份時間（僅在 00 分）
+                is_backup_time = (next_check_minute == 0 or next_check_minute == 60)
 
                 # 計算等待時間
                 wait_seconds = (next_health_check - datetime.now()).total_seconds()
@@ -858,7 +858,7 @@ class N8nMonitor:
                 # 執行任務
                 try:
                     if is_backup_time:
-                        # 每 30 分鐘：執行完整的監控與備份
+                        # 每 60 分鐘：執行完整的監控與備份
                         self.run()
                     else:
                         # 每 10 分鐘：僅執行健康檢查
