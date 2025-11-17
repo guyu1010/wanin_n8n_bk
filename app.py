@@ -2,48 +2,48 @@ import requests
 import json
 import subprocess
 import hashlib
+import copy
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
 import time
 
+
 class N8nMonitor:
+    """n8n 工作流程監控與備份系統"""
+
     def __init__(self, config_path: str = 'config.json'):
-        """初始化監控系統"""
         self.load_config(config_path)
         self.setup_logging()
         self.last_health_status = None
-        
+
     def load_config(self, config_path: str):
         """載入設定檔"""
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        
+
         self.n8n_url = config['n8n']['url'].rstrip('/')
         self.api_key = config['n8n']['api_key']
         self.git_repo_path = Path(config['git']['repo_path'])
-
-        # 通知設定
+        self.git_remote_url = config['git'].get('remote_url', 'https://github.com/guyu1010/wanin_n8n_bk_data')
         self.notifications = config.get('notifications', {})
-
-        # 排程設定
         self.schedule_config = config.get('schedule', {
             'enabled': False,
             'interval': 600,
             'run_on_startup': True
         })
 
-        # HTTP 請求設定
         self.headers = {
             'X-N8N-API-KEY': self.api_key,
             'Accept': 'application/json'
         }
         self.timeout = config.get('timeout', 10)
         self.max_retries = config.get('max_retries', 3)
-    
+
     def setup_logging(self):
-        """設定日誌"""
+        """設定日誌系統"""
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -53,213 +53,175 @@ class N8nMonitor:
             ]
         )
         self.logger = logging.getLogger(__name__)
-    
+
+    # ========== 健康檢查 ==========
+
     def check_health(self) -> Dict:
         """檢查 n8n 健康狀態"""
         try:
-            # 方法 1: 使用 n8n 的 healthz endpoint
-            health_url = f"{self.n8n_url}/healthz"
-            response = requests.get(health_url, timeout=self.timeout)
-            
+            response = requests.get(f"{self.n8n_url}/healthz", timeout=self.timeout)
+
             if response.status_code == 200:
-                self.logger.info("✓ n8n 服務正常運行")
                 return {
                     'status': 'healthy',
                     'response_time': response.elapsed.total_seconds(),
                     'timestamp': datetime.now().isoformat()
                 }
             else:
-                self.logger.warning(f"n8n 回應異常: HTTP {response.status_code}")
                 return {
                     'status': 'unhealthy',
                     'error': f'HTTP {response.status_code}',
                     'timestamp': datetime.now().isoformat()
                 }
-                
+
         except requests.exceptions.Timeout:
-            self.logger.error("✗ n8n 連線逾時")
-            return {
-                'status': 'timeout',
-                'error': 'Connection timeout',
-                'timestamp': datetime.now().isoformat()
-            }
+            return {'status': 'timeout', 'error': 'Connection timeout', 'timestamp': datetime.now().isoformat()}
         except requests.exceptions.ConnectionError as e:
-            self.logger.error(f"✗ 無法連線到 n8n: {e}")
-            return {
-                'status': 'down',
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
+            return {'status': 'down', 'error': str(e), 'timestamp': datetime.now().isoformat()}
         except Exception as e:
-            self.logger.error(f"✗ 健康檢查發生錯誤: {e}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-    
+            return {'status': 'error', 'error': str(e), 'timestamp': datetime.now().isoformat()}
+
+    def handle_health_change(self, health_status: Dict):
+        """處理健康狀態變更"""
+        current_status = health_status['status']
+
+        if self.last_health_status != current_status:
+            if current_status != 'healthy':
+                self.logger.error(f"✗ n8n 服務異常: {current_status}")
+                self.send_webhook_notification({
+                    'title': 'n8n 服務異常',
+                    'status': 'error',
+                    'health_status': health_status
+                })
+            else:
+                self.logger.info("✓ n8n 服務已恢復正常")
+                self.send_webhook_notification({
+                    'title': 'n8n 服務恢復',
+                    'status': 'success',
+                    'health_status': health_status
+                })
+            self.last_health_status = current_status
+
+    # ========== 工作流程操作 ==========
+
     def get_all_workflows(self) -> Optional[List[Dict]]:
-        """取得所有工作流程(帶重試機制)"""
+        """取得所有工作流程（帶重試機制）"""
         url = f"{self.n8n_url}/api/v1/workflows"
-        
+
         for attempt in range(self.max_retries):
             try:
                 response = requests.get(url, headers=self.headers, timeout=self.timeout)
                 response.raise_for_status()
-                workflows = response.json()['data']
-                self.logger.info(f"成功取得 {len(workflows)} 個工作流程")
-                return workflows
+                return response.json()['data']
             except Exception as e:
-                self.logger.warning(f"取得工作流程失敗 (嘗試 {attempt + 1}/{self.max_retries}): {e}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)  # 指數退避
+                    time.sleep(2 ** attempt)
                 else:
-                    self.logger.error("已達最大重試次數")
+                    self.logger.error(f"✗ 無法取得工作流程: {e}")
                     return None
-    
+
     def get_workflow_detail(self, workflow_id: str) -> Optional[Dict]:
         """取得工作流程詳細內容"""
-        url = f"{self.n8n_url}/api/v1/workflows/{workflow_id}"
         try:
-            response = requests.get(url, headers=self.headers, timeout=self.timeout)
+            response = requests.get(
+                f"{self.n8n_url}/api/v1/workflows/{workflow_id}",
+                headers=self.headers,
+                timeout=self.timeout
+            )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            self.logger.error(f"取得工作流程 {workflow_id} 失敗: {e}")
+        except Exception:
             return None
-    
+
     def calculate_hash(self, workflow_data: Dict) -> str:
         """計算工作流程的 hash 值（僅關注功能性變更）"""
-        import copy
-
-        # 深拷貝避免修改原始資料
         clean_data = copy.deepcopy(workflow_data)
 
         # 移除不影響功能的欄位
-        ignored_fields = ['updatedAt', 'createdAt', 'versionId', 'id']
-        for field in ignored_fields:
+        for field in ['updatedAt', 'createdAt', 'versionId', 'id']:
             clean_data.pop(field, None)
 
-        # 移除 nodes 中的位置資訊（位置改變不算功能變更）
+        # 移除 nodes 中的位置資訊
         if 'nodes' in clean_data:
             for node in clean_data['nodes']:
-                node.pop('position', None)  # 節點座標
-
-        # 移除 connections 的順序影響（使用 sorted）
-        # connections 的邏輯相同但順序不同，不算變更
+                node.pop('position', None)
 
         content = json.dumps(clean_data, sort_keys=True)
         return hashlib.sha256(content.encode()).hexdigest()
 
     def _analyze_workflow_changes(self, old_workflow: Dict, new_workflow: Dict) -> Dict:
         """分析工作流程的變更"""
-        changes = {
-            'added_nodes': [],
-            'removed_nodes': [],
-            'modified_nodes': []
-        }
+        changes = {'added_nodes': [], 'removed_nodes': [], 'modified_nodes': []}
 
         old_nodes = {node['id']: node for node in old_workflow.get('nodes', [])}
         new_nodes = {node['id']: node for node in new_workflow.get('nodes', [])}
 
+        # 新增的節點
         for node_id, node in new_nodes.items():
             if node_id not in old_nodes:
-                changes['added_nodes'].append(f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})")
+                changes['added_nodes'].append(
+                    f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})"
+                )
 
+        # 刪除的節點
         for node_id, node in old_nodes.items():
             if node_id not in new_nodes:
-                changes['removed_nodes'].append(f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})")
+                changes['removed_nodes'].append(
+                    f"{node.get('name', 'Unknown')} ({node.get('type', 'Unknown').split('.')[-1]})"
+                )
 
+        # 修改的節點
         for node_id in set(old_nodes.keys()) & set(new_nodes.keys()):
             old_node = old_nodes[node_id]
             new_node = new_nodes[node_id]
             if (old_node.get('name') != new_node.get('name') or
                 old_node.get('type') != new_node.get('type') or
                 old_node.get('parameters') != new_node.get('parameters')):
-                changes['modified_nodes'].append(f"{new_node.get('name', 'Unknown')} ({new_node.get('type', 'Unknown').split('.')[-1]})")
+                changes['modified_nodes'].append(
+                    f"{new_node.get('name', 'Unknown')} ({new_node.get('type', 'Unknown').split('.')[-1]})"
+                )
 
         return changes
 
     def _format_change_summary(self, changes: Dict) -> str:
-        """格式化變更摘要為簡潔文字"""
+        """格式化變更摘要"""
         summary_parts = []
 
-        if changes['added_nodes']:
-            summary_parts.append(f"🆕 新增 {len(changes['added_nodes'])} 個節點: {', '.join(changes['added_nodes'][:3])}")
-            if len(changes['added_nodes']) > 3:
-                summary_parts[-1] += f" 等 {len(changes['added_nodes'])} 個"
-
-        if changes['modified_nodes']:
-            summary_parts.append(f"✏️ 修改 {len(changes['modified_nodes'])} 個節點: {', '.join(changes['modified_nodes'][:3])}")
-            if len(changes['modified_nodes']) > 3:
-                summary_parts[-1] += f" 等 {len(changes['modified_nodes'])} 個"
-
-        if changes['removed_nodes']:
-            summary_parts.append(f"🗑️ 刪除 {len(changes['removed_nodes'])} 個節點: {', '.join(changes['removed_nodes'][:3])}")
-            if len(changes['removed_nodes']) > 3:
-                summary_parts[-1] += f" 等 {len(changes['removed_nodes'])} 個"
+        for change_type, icon in [
+            ('added_nodes', '🆕 新增'),
+            ('modified_nodes', '✏️ 修改'),
+            ('removed_nodes', '🗑️ 刪除')
+        ]:
+            nodes = changes[change_type]
+            if nodes:
+                preview = ', '.join(nodes[:3])
+                if len(nodes) > 3:
+                    preview += f" 等 {len(nodes)} 個"
+                summary_parts.append(f"{icon} {len(nodes)} 個節點: {preview}")
 
         return '\n  '.join(summary_parts) if summary_parts else '無明顯變更'
 
+    # ========== 敏感資訊處理 ==========
+
     def sanitize_workflow(self, workflow: Dict) -> Dict:
         """清理工作流程中的敏感資訊"""
-        import copy
         sanitized = copy.deepcopy(workflow)
-
-        # 清理節點中的敏感參數
         sensitive_keys = ['apiKey', 'api_key', 'password', 'token', 'secret', 'credential']
 
         if 'nodes' in sanitized:
             for node in sanitized['nodes']:
                 if 'parameters' in node:
-                    for key in list(node['parameters'].keys()):
-                        # 檢查是否為敏感欄位
-                        if any(sensitive in key.lower() for sensitive in sensitive_keys):
-                            node['parameters'][key] = "***REMOVED***"
-                        # 遞迴清理巢狀結構
-                        elif isinstance(node['parameters'][key], dict):
-                            self._sanitize_dict(node['parameters'][key], sensitive_keys)
+                    self._sanitize_dict(node['parameters'], sensitive_keys)
 
         return sanitized
-
-    def _obfuscate_value(self, value: str) -> str:
-        """簡單混淆敏感值（保留前後部分，中間用 * 代替）"""
-        import re
-
-        # Anthropic API keys: sk-ant-xxx
-        if re.match(r'=?sk-ant-[a-zA-Z0-9\-_]+', value):
-            # 保留前10個字元和後4個字元
-            if len(value) > 14:
-                prefix = value[:10]
-                suffix = value[-4:]
-                return f"{prefix}{'*' * 20}{suffix}"
-            return value[:6] + '*' * (len(value) - 6)
-
-        # OpenAI API keys: sk-xxx
-        if re.match(r'sk-[a-zA-Z0-9]{48}', value):
-            return value[:8] + '*' * 35 + value[-5:]
-
-        # JWT tokens
-        if re.match(r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', value):
-            parts = value.split('.')
-            if len(parts) >= 2:
-                return f"{parts[0][:10]}...****...{parts[-1][-10:]}"
-
-        # GitHub tokens
-        if re.match(r'gh[po]_[a-zA-Z0-9]{36}', value):
-            return value[:8] + '*' * 25 + value[-5:]
-
-        return value
 
     def _sanitize_dict(self, data: Dict, sensitive_keys: List[str]):
         """遞迴混淆字典中的敏感資訊"""
         for key in list(data.keys()):
             if any(sensitive in key.lower() for sensitive in sensitive_keys):
-                # 只混淆字串值
                 if isinstance(data[key], str) and len(data[key]) > 10:
                     data[key] = self._obfuscate_value(data[key])
             elif isinstance(data[key], str):
-                # 檢查字串值是否包含敏感模式
                 obfuscated = self._obfuscate_value(data[key])
                 if obfuscated != data[key]:
                     data[key] = obfuscated
@@ -270,198 +232,116 @@ class N8nMonitor:
                     if isinstance(item, dict):
                         self._sanitize_dict(item, sensitive_keys)
 
+    def _obfuscate_value(self, value: str) -> str:
+        """混淆敏感值"""
+        patterns = [
+            (r'=?sk-ant-[a-zA-Z0-9\-_]+', lambda v: f"{v[:10]}{'*' * 20}{v[-4:]}" if len(v) > 14 else f"{v[:6]}{'*' * (len(v) - 6)}"),
+            (r'sk-[a-zA-Z0-9]{48}', lambda v: f"{v[:8]}{'*' * 35}{v[-5:]}"),
+            (r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', lambda v: f"{v.split('.')[0][:10]}...****...{v.split('.')[-1][-10:]}"),
+            (r'gh[po]_[a-zA-Z0-9]{36}', lambda v: f"{v[:8]}{'*' * 25}{v[-5:]}")
+        ]
+
+        for pattern, obfuscator in patterns:
+            if re.match(pattern, value):
+                return obfuscator(value)
+
+        return value
+
     def save_workflow(self, workflow: Dict) -> Path:
         """儲存工作流程到本地"""
-        # 清理檔名中的特殊字元
         safe_name = "".join(c for c in workflow['name'] if c.isalnum() or c in (' ', '-', '_')).strip()
-
-        # 如果清理後是空字串，使用預設名稱
-        if not safe_name:
-            safe_name = "unnamed_workflow"
-            self.logger.warning(f"工作流程 ID {workflow['id']} 的名稱無法清理，使用預設名稱")
-
-        # 限制檔名長度，避免過長
-        if len(safe_name) > 100:
-            safe_name = safe_name[:100]
-            self.logger.info(f"檔名過長，已截斷至 100 字元")
+        safe_name = safe_name[:100] if safe_name else "unnamed_workflow"
 
         filename = f"{workflow['id']}_{safe_name}.json"
-
         workflows_dir = self.git_repo_path / 'workflows'
         workflows_dir.mkdir(parents=True, exist_ok=True)
 
         filepath = workflows_dir / filename
-
-        # 簡單混淆敏感資訊後儲存
         sanitized_workflow = self.sanitize_workflow(workflow)
 
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(sanitized_workflow, f, indent=2, ensure_ascii=False)
 
         return filepath
-    
-    def git_commit_and_push(self, changed_workflows: List[str]) -> bool:
-        """提交變更到 Git（含重試機制）"""
-        try:
-            self.logger.info("=" * 50)
-            self.logger.info("開始執行 Git 操作")
 
-            # 確保在 git repo 目錄，執行 git add
-            self.logger.info(f"執行: git add . (在目錄: {self.git_repo_path})")
-            result = subprocess.run(['git', 'add', '.'],
-                         cwd=self.git_repo_path, check=True,
-                         capture_output=True, text=True, encoding='utf-8')
+    # ========== Git 操作 ==========
+
+    def _run_git_command(self, cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+        """執行 Git 命令"""
+        return subprocess.run(
+            cmd,
+            cwd=self.git_repo_path,
+            check=check,
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+
+    def git_commit_and_push(self, changed_workflows: List[str]) -> bool:
+        """提交變更到 Git"""
+        try:
+            # Git add
+            result = self._run_git_command(['git', 'add', '.'], check=False)
+            if result.returncode != 0 and 'ignored by one of your .gitignore files' not in result.stderr:
+                self.logger.error(f"✗ Git add 失敗: {result.stderr}")
+                return False
 
             # 檢查是否有變更
-            self.logger.info("檢查 git status...")
-            status = subprocess.run(['git', 'status', '--porcelain'],
-                                  cwd=self.git_repo_path, check=True,
-                                  capture_output=True, text=True, encoding='utf-8')
-
+            status = self._run_git_command(['git', 'status', '--porcelain'])
             if not status.stdout.strip():
-                self.logger.info("沒有需要提交的變更")
                 return True
 
-            # 統計變更數量（不顯示詳細列表）
-            changed_files = [line for line in status.stdout.strip().split('\n') if line.strip()]
-            self.logger.info(f"偵測到 {len(changed_files)} 個檔案變更")
-
-            # 建立 commit message
+            # Commit
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            commit_msg = f"[自動備份] {timestamp}\n\n變更的工作流程:\n"
-            commit_msg += "\n".join(f"- {name}" for name in changed_workflows)
+            commit_msg = f"[自動備份] {timestamp}\n\n變更的工作流程:\n" + "\n".join(f"- {name}" for name in changed_workflows)
 
-            # 執行 commit
-            self.logger.info("執行: git commit")
-            subprocess.run(['git', 'commit', '-m', commit_msg],
-                         cwd=self.git_repo_path, check=True,
-                         capture_output=True, text=True, encoding='utf-8')
-            self.logger.info("✓ Commit 成功")
+            self._run_git_command(['git', 'commit', '-m', commit_msg])
 
-            # 執行 push（含重試機制）
-            max_push_retries = 3
-            for retry in range(max_push_retries):
+            # Push (含重試機制)
+            for retry in range(3):
                 try:
-                    self.logger.info(f"執行: git push (嘗試 {retry + 1}/{max_push_retries})")
-                    push_result = subprocess.run(['git', 'push'],
-                                 cwd=self.git_repo_path, check=True,
-                                 capture_output=True, text=True, encoding='utf-8')
-
-                    if push_result.stdout:
-                        self.logger.info(f"Push 輸出: {push_result.stdout}")
-                    if push_result.stderr:
-                        self.logger.info(f"Push 訊息: {push_result.stderr}")
-
-                    self.logger.info(f"✓ 成功提交並推送 {len(changed_workflows)} 個工作流程到 Git")
-                    self.logger.info("=" * 50)
+                    self._run_git_command(['git', 'push'])
+                    self.logger.info(f"✓ 成功推送 {len(changed_workflows)} 個工作流程到 Git")
                     return True
 
                 except subprocess.CalledProcessError as e:
-                    # 如果是第一次 push，需要設定 upstream
-                    if 'no upstream branch' in e.stderr or 'src refspec main does not match any' in e.stderr:
-                        self.logger.info("偵測到首次推送，執行: git push --set-upstream origin main")
-                        try:
-                            push_result = subprocess.run(['git', 'push', '--set-upstream', 'origin', 'main'],
-                                         cwd=self.git_repo_path, check=True,
-                                         capture_output=True, text=True, encoding='utf-8')
-                            self.logger.info("✓ 成功推送到遠端")
-                            return True
-                        except subprocess.CalledProcessError as push_error:
-                            # 如果遠端是全新的空倉庫，可能需要先 pull
-                            if 'couldn\'t find remote ref' in push_error.stderr or 'does not match any' in push_error.stderr:
-                                self.logger.warning("⚠️ 遠端倉庫可能有預設文件，嘗試先拉取")
-                                try:
-                                    subprocess.run(['git', 'pull', 'origin', 'main', '--allow-unrelated-histories'],
-                                                 cwd=self.git_repo_path, check=True,
-                                                 capture_output=True, text=True, encoding='utf-8')
-                                    self.logger.info("✓ 成功拉取遠端文件")
-                                    continue  # 重試 push
-                                except subprocess.CalledProcessError:
-                                    # 遠端真的是空的，強制推送
-                                    self.logger.info("遠端為空，執行首次推送")
-                                    push_result = subprocess.run(['git', 'push', '-u', 'origin', 'main'],
-                                                 cwd=self.git_repo_path, check=True,
-                                                 capture_output=True, text=True, encoding='utf-8')
-                                    self.logger.info("✓ 成功推送到遠端")
-                                    return True
-                            raise
-
-                    # 如果被拒絕（遠端有更新），先 pull 再 push
+                    if 'no upstream branch' in e.stderr:
+                        self._run_git_command(['git', 'push', '--set-upstream', 'origin', 'main'])
+                        return True
                     elif 'rejected' in e.stderr or 'fetch first' in e.stderr:
-                        self.logger.warning("⚠️ 推送被拒絕，遠端有更新")
-                        self.logger.info("執行: git pull (使用 merge 策略，衝突時優先採用遠端版本)")
-
+                        # 先 pull 再重試
                         try:
-                            # 使用 merge 策略，衝突時自動選擇遠端版本
-                            pull_result = subprocess.run([
-                                'git', 'pull', '--no-rebase',
-                                '-X', 'theirs',  # 衝突時選擇遠端版本
-                                'origin', 'main'
-                            ], cwd=self.git_repo_path, check=True,
-                               capture_output=True, text=True, encoding='utf-8')
-
-                            self.logger.info("✓ 成功拉取並合併遠端變更")
-
-                            # 繼續下一輪重試
+                            self._run_git_command(['git', 'pull', '--no-rebase', '-X', 'theirs', 'origin', 'main'])
                             continue
-
-                        except subprocess.CalledProcessError as pull_error:
-                            self.logger.error(f"✗ Pull 失敗: {pull_error.stderr}")
-
-                            # 如果 merge 也失敗，嘗試重置到遠端狀態
-                            self.logger.warning("⚠️ 嘗試重置到遠端最新狀態")
-                            try:
-                                subprocess.run(['git', 'fetch', 'origin', 'main'],
-                                             cwd=self.git_repo_path, check=True,
-                                             capture_output=True, text=True, encoding='utf-8')
-                                subprocess.run(['git', 'reset', '--hard', 'origin/main'],
-                                             cwd=self.git_repo_path, check=True,
-                                             capture_output=True, text=True, encoding='utf-8')
-                                self.logger.info("✓ 已重置到遠端最新狀態")
-                                return False  # 本次推送放棄，下次會重新備份
-                            except subprocess.CalledProcessError:
-                                self.logger.error("✗ 無法重置到遠端狀態")
-                                return False
-
-                    # 其他錯誤
-                    elif retry < max_push_retries - 1:
-                        wait_time = 2 ** retry  # 指數退避: 1s, 2s, 4s
-                        self.logger.warning(f"Push 失敗，{wait_time} 秒後重試...")
-                        time.sleep(wait_time)
+                        except subprocess.CalledProcessError:
+                            self.logger.warning("⚠️ Pull 失敗，重置到遠端狀態")
+                            self._run_git_command(['git', 'fetch', 'origin', 'main'])
+                            self._run_git_command(['git', 'reset', '--hard', 'origin/main'])
+                            return False
+                    elif retry < 2:
+                        time.sleep(2 ** retry)
                     else:
-                        # 最後一次重試失敗
                         raise
 
-            # 如果所有重試都失敗
-            self.logger.error("已達最大重試次數，推送失敗")
             return False
 
         except subprocess.CalledProcessError as e:
-            self.logger.error("=" * 50)
-            self.logger.error(f"✗ Git 操作失敗")
-            self.logger.error(f"指令: {e.cmd}")
-            self.logger.error(f"返回碼: {e.returncode}")
-            if e.stdout:
-                self.logger.error(f"標準輸出: {e.stdout}")
-            if e.stderr:
-                self.logger.error(f"錯誤輸出: {e.stderr}")
-            self.logger.error("=" * 50)
+            self.logger.error(f"✗ Git 操作失敗: {e.cmd} (返回碼: {e.returncode})")
             return False
         except Exception as e:
-            self.logger.error(f"✗ Git 操作發生未預期錯誤: {e}")
+            self.logger.error(f"✗ Git 操作發生錯誤: {e}")
             return False
-    
+
+    # ========== 備份流程 ==========
+
     def backup_workflows(self) -> Dict:
         """執行工作流程備份"""
-        self.logger.info("=" * 50)
-        self.logger.info("開始備份工作流程")
-
         result = {
             'success': False,
             'changed_count': 0,
             'total_count': 0,
             'changed_workflows': [],
-            'workflow_changes': {},  # 新增：儲存每個 workflow 的變更詳情
+            'workflow_changes': {},
             'error': None
         }
 
@@ -473,19 +353,12 @@ class N8nMonitor:
 
         result['total_count'] = len(workflows)
 
-        # 載入上次的 hash 和完整資料
+        # 載入上次的 hash 和資料
         hash_file = self.git_repo_path / '.workflow_hashes.json'
         data_file = self.git_repo_path / '.workflow_data.json'
-        old_hashes = {}
-        old_workflows = {}
 
-        if hash_file.exists():
-            with open(hash_file, 'r', encoding='utf-8') as f:
-                old_hashes = json.load(f)
-
-        if data_file.exists():
-            with open(data_file, 'r', encoding='utf-8') as f:
-                old_workflows = json.load(f)
+        old_hashes = json.load(open(hash_file, 'r', encoding='utf-8')) if hash_file.exists() else {}
+        old_workflows = json.load(open(data_file, 'r', encoding='utf-8')) if data_file.exists() else {}
 
         new_hashes = {}
         new_workflows = {}
@@ -497,7 +370,6 @@ class N8nMonitor:
             if detail is None:
                 continue
 
-            # 計算 hash
             current_hash = self.calculate_hash(detail)
             new_hashes[workflow['id']] = current_hash
             new_workflows[workflow['id']] = detail
@@ -506,34 +378,22 @@ class N8nMonitor:
             if workflow['id'] not in old_hashes or old_hashes[workflow['id']] != current_hash:
                 workflow_name = workflow['name']
 
-                # 分析變更（如果有舊版本）
                 if workflow['id'] in old_workflows:
+                    # 分析變更
                     changes = self._analyze_workflow_changes(old_workflows[workflow['id']], detail)
-
-                    # 檢查是否有實質變更（非僅位置改變）
-                    has_real_changes = (
-                        len(changes['added_nodes']) > 0 or
-                        len(changes['modified_nodes']) > 0 or
-                        len(changes['removed_nodes']) > 0
-                    )
+                    has_real_changes = any(changes[k] for k in ['added_nodes', 'modified_nodes', 'removed_nodes'])
 
                     if has_real_changes:
-                        # 有實質變更，記錄並備份
                         change_summary = self._format_change_summary(changes)
-                        self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
-                        self.logger.info(f"  {change_summary}")
+                        self.logger.info(f"📝 {workflow_name}")
+                        self.logger.info(f"   {change_summary}")
                         result['workflow_changes'][workflow_name] = change_summary
-
                         self.save_workflow(detail)
                         changed_workflows.append(workflow_name)
-                    # 如果沒有實質變更，靜默跳過（不記錄日誌，不備份）
-
                 else:
-                    # 新建立的 workflow
-                    self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
+                    # 新建立的工作流程
+                    self.logger.info(f"📝 {workflow_name} (新建立)")
                     result['workflow_changes'][workflow_name] = "🆕 新建立的工作流程"
-                    self.logger.info(f"  🆕 新建立的工作流程")
-
                     self.save_workflow(detail)
                     changed_workflows.append(workflow_name)
 
@@ -541,48 +401,39 @@ class N8nMonitor:
         with open(hash_file, 'w', encoding='utf-8') as f:
             json.dump(new_hashes, f, indent=2)
 
-        # 儲存 workflow 資料時也要 sanitize（避免敏感資訊外洩）
-        sanitized_workflows = {}
-        for workflow_id, workflow_data in new_workflows.items():
-            sanitized_workflows[workflow_id] = self.sanitize_workflow(workflow_data)
-
+        sanitized_workflows = {wid: self.sanitize_workflow(wdata) for wid, wdata in new_workflows.items()}
         with open(data_file, 'w', encoding='utf-8') as f:
             json.dump(sanitized_workflows, f, indent=2, ensure_ascii=False)
 
         result['changed_count'] = len(changed_workflows)
         result['changed_workflows'] = changed_workflows
 
-        # 如果有變更,提交到 Git
+        # 提交到 Git
         if changed_workflows:
             if self.git_commit_and_push(changed_workflows):
                 result['success'] = True
             else:
                 result['error'] = 'Git 提交失敗'
         else:
-            self.logger.info("沒有偵測到工作流程變更")
             result['success'] = True
 
         return result
-    
+
+    # ========== 通知系統 ==========
+
     def send_webhook_notification(self, data: Dict):
-        """發送 Webhook 通知 (Slack, Discord, Teams, etc.)"""
+        """發送 Webhook 通知"""
         webhook_config = self.notifications.get('webhook', {})
         if not webhook_config.get('enabled', False):
             return
 
         try:
-            # 根據不同平台格式化訊息
             platform = webhook_config.get('platform', 'generic')
 
             if platform == 'slack':
                 payload = {
                     'text': data.get('message', ''),
-                    'blocks': [
-                        {
-                            'type': 'section',
-                            'text': {'type': 'mrkdwn', 'text': data.get('message', '')}
-                        }
-                    ]
+                    'blocks': [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': data.get('message', '')}}]
                 }
             elif platform == 'discord':
                 payload = {
@@ -594,71 +445,50 @@ class N8nMonitor:
                     }]
                 }
             elif platform == 'teams':
-                # 建立完整的 Adaptive Card 結構
                 payload = self._create_teams_card(data)
-            else:  # generic
+            else:
                 payload = data
 
-            response = requests.post(
-                webhook_config['url'],
-                json=payload,
-                timeout=10
-            )
+            response = requests.post(webhook_config['url'], json=payload, timeout=10)
             response.raise_for_status()
-            self.logger.info("✓ Webhook 通知已發送")
 
         except Exception as e:
-            self.logger.error(f"發送 Webhook 失敗: {e}")
+            self.logger.error(f"✗ Webhook 發送失敗: {e}")
 
     def _create_teams_card(self, data: Dict) -> Dict:
         """創建 Microsoft Teams Adaptive Card"""
         status = data.get('status', 'info')
         title = data.get('title', 'n8n 監控通知')
 
-        # 根據狀態設定顏色和圖示
-        if status == 'error':
-            color = 'Attention'  # 紅色
-            icon = '⚠️'
-        elif status == 'success':
-            color = 'Good'  # 綠色
-            icon = '✅'
-        else:
-            color = 'Default'  # 灰色
-            icon = 'ℹ️'
+        color_map = {'error': 'Attention', 'success': 'Good', 'info': 'Default'}
+        icon_map = {'error': '⚠️', 'success': '✅', 'info': 'ℹ️'}
 
-        # 基本卡片結構
         card = {
             "type": "message",
-            "attachments": [
-                {
-                    "contentType": "application/vnd.microsoft.card.adaptive",
-                    "content": {
-                        "type": "AdaptiveCard",
-                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                        "version": "1.4",
-                        "body": [
-                            {
-                                "type": "TextBlock",
-                                "text": f"{icon} {title}",
-                                "size": "Large",
-                                "weight": "Bolder",
-                                "color": color
-                            }
-                        ]
-                    }
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "type": "AdaptiveCard",
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "version": "1.4",
+                    "body": [{
+                        "type": "TextBlock",
+                        "text": f"{icon_map.get(status, 'ℹ️')} {title}",
+                        "size": "Large",
+                        "weight": "Bolder",
+                        "color": color_map.get(status, 'Default')
+                    }]
                 }
-            ]
+            }]
         }
 
         body = card["attachments"][0]["content"]["body"]
 
-        # 根據不同的通知類型添加內容
+        # 備份完成通知
         if 'backup_result' in data:
-            # 備份完成通知
             result = data['backup_result']
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            # 添加時間和統計資訊
             body.append({
                 "type": "FactSet",
                 "facts": [
@@ -668,7 +498,6 @@ class N8nMonitor:
                 ]
             })
 
-            # 如果有變更，顯示變更列表和詳情
             if result.get('changed_workflows'):
                 body.append({
                     "type": "TextBlock",
@@ -679,7 +508,6 @@ class N8nMonitor:
 
                 workflow_changes = result.get('workflow_changes', {})
                 for workflow_name in result['changed_workflows']:
-                    # 顯示工作流程名稱
                     body.append({
                         "type": "TextBlock",
                         "text": f"📝 **{workflow_name}**",
@@ -687,11 +515,8 @@ class N8nMonitor:
                         "weight": "Bolder"
                     })
 
-                    # 顯示變更摘要（如果有）
                     if workflow_name in workflow_changes:
-                        change_summary = workflow_changes[workflow_name]
-                        # 將多行摘要分開顯示
-                        for line in change_summary.split('\n'):
+                        for line in workflow_changes[workflow_name].split('\n'):
                             if line.strip():
                                 body.append({
                                     "type": "TextBlock",
@@ -702,24 +527,14 @@ class N8nMonitor:
                                     "wrap": True
                                 })
 
-            # 添加連結按鈕
             card["attachments"][0]["content"]["actions"] = [
-                {
-                    "type": "Action.OpenUrl",
-                    "title": "開啟 n8n",
-                    "url": self.n8n_url
-                },
-                {
-                    "type": "Action.OpenUrl",
-                    "title": "查看備份",
-                    "url": "https://github.com/guyu1010/wanin_n8n_bk_data"
-                }
+                {"type": "Action.OpenUrl", "title": "開啟 n8n", "url": self.n8n_url},
+                {"type": "Action.OpenUrl", "title": "查看備份", "url": self.git_remote_url}
             ]
 
+        # 健康狀態通知
         elif 'health_status' in data:
-            # 健康狀態變更通知
             health = data['health_status']
-
             body.append({
                 "type": "FactSet",
                 "facts": [
@@ -728,7 +543,6 @@ class N8nMonitor:
                 ]
             })
 
-            # 如果有錯誤訊息
             if 'error' in health:
                 body.append({
                     "type": "TextBlock",
@@ -738,60 +552,31 @@ class N8nMonitor:
                     "color": "Attention"
                 })
 
-            # 添加連結按鈕
             card["attachments"][0]["content"]["actions"] = [
-                {
-                    "type": "Action.OpenUrl",
-                    "title": "檢查 n8n",
-                    "url": self.n8n_url
-                }
+                {"type": "Action.OpenUrl", "title": "檢查 n8n", "url": self.n8n_url}
             ]
+
+        # 一般訊息
         else:
-            # 一般訊息
-            message = data.get('message', '')
             body.append({
                 "type": "TextBlock",
-                "text": message,
+                "text": data.get('message', ''),
                 "wrap": True
             })
 
         return card
 
-    def handle_health_change(self, health_status: Dict):
-        """處理健康狀態變更"""
-        current_status = health_status['status']
+    # ========== 主執行流程 ==========
 
-        # 如果狀態改變,發送通知
-        if self.last_health_status != current_status:
-            if current_status != 'healthy':
-                # n8n 出現問題
-                self.logger.error(f"n8n 服務異常: {current_status}")
-                self.send_webhook_notification({
-                    'title': 'n8n 服務異常',
-                    'status': 'error',
-                    'health_status': health_status
-                })
-            else:
-                # n8n 恢復正常
-                self.logger.info("n8n 服務已恢復正常")
-                self.send_webhook_notification({
-                    'title': 'n8n 服務恢復',
-                    'status': 'success',
-                    'health_status': health_status
-                })
-
-            self.last_health_status = current_status
-    
     def run(self):
         """執行完整的監控與備份流程"""
-        self.logger.info("開始執行 n8n 監控與備份")
-        
-        # 1. 檢查健康狀態
+        # 健康檢查
         health_status = self.check_health()
         self.handle_health_change(health_status)
-        
-        # 2. 如果 n8n 正常,執行備份
+
+        # 執行備份
         if health_status['status'] == 'healthy':
+            self.logger.info("🔄 開始備份工作流程...")
             backup_result = self.backup_workflows()
 
             if backup_result['changed_count'] > 0:
@@ -800,93 +585,74 @@ class N8nMonitor:
                     'status': 'success',
                     'backup_result': backup_result
                 })
+                self.logger.info(f"✓ 備份完成 ({backup_result['changed_count']}/{backup_result['total_count']} 個變更)")
+            else:
+                self.logger.info(f"✓ 無變更 (共 {backup_result['total_count']} 個工作流程)")
         else:
-            self.logger.warning("由於 n8n 服務異常,跳過備份作業")
-        
-        self.logger.info("監控與備份流程結束")
-        self.logger.info("=" * 50)
+            self.logger.warning("⚠️ 服務異常，跳過備份")
 
     def run_scheduled(self):
-        """執行排程模式 - 健康檢查 10 分鐘，備份 60 分鐘"""
+        """執行排程模式"""
         run_on_startup = self.schedule_config.get('run_on_startup', True)
 
         self.logger.info("=" * 50)
-        self.logger.info("🚀 n8n 監控系統啟動（排程模式）")
-        self.logger.info("⏱️  健康檢查: 每 10 分鐘")
-        self.logger.info("⏱️  備份執行: 每 60 分鐘（每小時的 00 分）")
-        self.logger.info(f"🔄 啟動時執行: {'是' if run_on_startup else '否'}")
+        self.logger.info("🚀 n8n 監控系統啟動")
+        self.logger.info("⏱️  健康檢查: 每 10 分鐘 | 備份: 每小時")
         self.logger.info("=" * 50)
 
-        # 如果設定為啟動時執行，立即執行一次完整流程
+        # 啟動時執行
         if run_on_startup:
-            self.logger.info("⚡ 立即執行第一次監控與備份...")
             try:
                 self.run()
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                self.logger.error(f"執行時發生錯誤: {e}")
+                self.logger.error(f"✗ 執行錯誤: {e}")
 
-        # 進入排程循環
+        # 排程循環
         try:
             while True:
                 now = datetime.now()
 
-                # 計算下次健康檢查時間（每 10 分鐘整數倍）
-                next_health_check = now.replace(second=0, microsecond=0)
+                # 計算下次執行時間
+                next_check = now.replace(second=0, microsecond=0)
                 current_minute = now.minute
-                next_check_minute = ((current_minute // 10) + 1) * 10
+                next_minute = ((current_minute // 10) + 1) * 10
 
-                if next_check_minute >= 60:
-                    next_health_check = next_health_check.replace(minute=0) + timedelta(hours=1)
+                if next_minute >= 60:
+                    next_check = next_check.replace(minute=0) + timedelta(hours=1)
                 else:
-                    next_health_check = next_health_check.replace(minute=next_check_minute)
+                    next_check = next_check.replace(minute=next_minute)
 
-                # 檢查是否為備份時間（僅在 00 分）
-                is_backup_time = (next_check_minute == 0 or next_check_minute == 60)
+                is_backup_time = (next_minute == 0 or next_minute == 60)
+                wait_seconds = (next_check - datetime.now()).total_seconds()
 
-                # 計算等待時間
-                wait_seconds = (next_health_check - datetime.now()).total_seconds()
-
-                if is_backup_time:
-                    self.logger.info(f"⏰ 下次執行: {next_health_check.strftime('%Y-%m-%d %H:%M:%S')} [健康檢查 + 備份] (等待 {int(wait_seconds)} 秒)")
-                else:
-                    self.logger.info(f"⏰ 下次執行: {next_health_check.strftime('%Y-%m-%d %H:%M:%S')} [健康檢查] (等待 {int(wait_seconds)} 秒)")
+                task_type = "健康檢查 + 備份" if is_backup_time else "健康檢查"
+                self.logger.info(f"⏰ 下次執行: {next_check.strftime('%H:%M')} [{task_type}]")
 
                 time.sleep(wait_seconds)
 
-                # 執行任務
                 try:
                     if is_backup_time:
-                        # 每 60 分鐘：執行完整的監控與備份
                         self.run()
                     else:
-                        # 每 10 分鐘：僅執行健康檢查
-                        self.logger.info("開始執行健康檢查")
                         health_status = self.check_health()
                         self.handle_health_change(health_status)
-                        self.logger.info("健康檢查結束")
-                        self.logger.info("=" * 50)
-
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
-                    self.logger.error(f"執行時發生錯誤: {e}")
+                    self.logger.error(f"✗ 執行錯誤: {e}")
 
         except KeyboardInterrupt:
-            self.logger.info("\n")
+            self.logger.info("\n" + "=" * 50)
+            self.logger.info("⛔ 監控系統已停止")
             self.logger.info("=" * 50)
-            self.logger.info("⛔ 收到中斷訊號，正在停止監控系統...")
-            self.logger.info("=" * 50)
+
 
 if __name__ == '__main__':
-    import sys
-
     monitor = N8nMonitor('config.json')
 
-    # 檢查是否啟用排程模式
     if monitor.schedule_config.get('enabled', False):
         monitor.run_scheduled()
     else:
-        # 單次執行模式（兼容舊版使用方式）
         monitor.run()
