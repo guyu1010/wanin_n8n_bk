@@ -505,21 +505,37 @@ class N8nMonitor:
             # 檢查是否有變更
             if workflow['id'] not in old_hashes or old_hashes[workflow['id']] != current_hash:
                 workflow_name = workflow['name']
-                self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
 
                 # 分析變更（如果有舊版本）
                 if workflow['id'] in old_workflows:
                     changes = self._analyze_workflow_changes(old_workflows[workflow['id']], detail)
-                    change_summary = self._format_change_summary(changes)
-                    self.logger.info(f"  {change_summary}")
-                    result['workflow_changes'][workflow_name] = change_summary
+
+                    # 檢查是否有實質變更（非僅位置改變）
+                    has_real_changes = (
+                        len(changes['added_nodes']) > 0 or
+                        len(changes['modified_nodes']) > 0 or
+                        len(changes['removed_nodes']) > 0
+                    )
+
+                    if has_real_changes:
+                        # 有實質變更，記錄並備份
+                        change_summary = self._format_change_summary(changes)
+                        self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
+                        self.logger.info(f"  {change_summary}")
+                        result['workflow_changes'][workflow_name] = change_summary
+
+                        self.save_workflow(detail)
+                        changed_workflows.append(workflow_name)
+                    # 如果沒有實質變更，靜默跳過（不記錄日誌，不備份）
+
                 else:
                     # 新建立的 workflow
+                    self.logger.info(f"偵測到變更: {workflow_name} (ID: {workflow['id']})")
                     result['workflow_changes'][workflow_name] = "🆕 新建立的工作流程"
                     self.logger.info(f"  🆕 新建立的工作流程")
 
-                self.save_workflow(detail)
-                changed_workflows.append(workflow_name)
+                    self.save_workflow(detail)
+                    changed_workflows.append(workflow_name)
 
         # 儲存新的 hash 和資料
         with open(hash_file, 'w', encoding='utf-8') as f:
@@ -791,18 +807,19 @@ class N8nMonitor:
         self.logger.info("=" * 50)
 
     def run_scheduled(self):
-        """執行排程模式 - 在每小時的 00 分和 30 分執行"""
+        """執行排程模式 - 健康檢查 10 分鐘，備份 60 分鐘"""
         run_on_startup = self.schedule_config.get('run_on_startup', True)
 
         self.logger.info("=" * 50)
         self.logger.info("🚀 n8n 監控系統啟動（排程模式）")
-        self.logger.info("⏱️  執行時間: 每小時的 00 分和 30 分")
+        self.logger.info("⏱️  健康檢查: 每 10 分鐘")
+        self.logger.info("⏱️  備份執行: 每 60 分鐘（每小時的 00 分）")
         self.logger.info(f"🔄 啟動時執行: {'是' if run_on_startup else '否'}")
         self.logger.info("=" * 50)
 
-        # 如果設定為啟動時執行，立即執行一次
+        # 如果設定為啟動時執行，立即執行一次完整流程
         if run_on_startup:
-            self.logger.info("⚡ 立即執行第一次監控...")
+            self.logger.info("⚡ 立即執行第一次監控與備份...")
             try:
                 self.run()
             except KeyboardInterrupt:
@@ -813,35 +830,44 @@ class N8nMonitor:
         # 進入排程循環
         try:
             while True:
-                # 計算下次執行時間（每小時的 00 分或 30 分）
                 now = datetime.now()
-                next_run = now.replace(second=0, microsecond=0)
 
-                # 決定下一個執行時間點
-                if now.minute < 30:
-                    # 下一個執行時間是本小時的 30 分
-                    next_run = next_run.replace(minute=30)
+                # 計算下次健康檢查時間（每 10 分鐘整數倍）
+                next_health_check = now.replace(second=0, microsecond=0)
+                current_minute = now.minute
+                next_check_minute = ((current_minute // 10) + 1) * 10
+
+                if next_check_minute >= 60:
+                    next_health_check = next_health_check.replace(minute=0) + timedelta(hours=1)
                 else:
-                    # 下一個執行時間是下一小時的 00 分
-                    next_run = next_run.replace(minute=0)
-                    next_run = next_run + timedelta(hours=1)
+                    next_health_check = next_health_check.replace(minute=next_check_minute)
 
-                # 如果計算出的時間已經過去（可能剛好在整點或半點），則跳到下一個時間點
-                if next_run <= now:
-                    if next_run.minute == 0:
-                        next_run = next_run.replace(minute=30)
-                    else:
-                        next_run = next_run.replace(minute=0) + timedelta(hours=1)
+                # 檢查是否為備份時間（僅在 00 分）
+                is_backup_time = (next_check_minute == 0 or next_check_minute == 60)
 
-                # 計算需要等待的秒數
-                wait_seconds = (next_run - datetime.now()).total_seconds()
+                # 計算等待時間
+                wait_seconds = (next_health_check - datetime.now()).total_seconds()
 
-                self.logger.info(f"⏰ 下次執行時間: {next_run.strftime('%Y-%m-%d %H:%M:%S')} (等待 {int(wait_seconds)} 秒)")
+                if is_backup_time:
+                    self.logger.info(f"⏰ 下次執行: {next_health_check.strftime('%Y-%m-%d %H:%M:%S')} [健康檢查 + 備份] (等待 {int(wait_seconds)} 秒)")
+                else:
+                    self.logger.info(f"⏰ 下次執行: {next_health_check.strftime('%Y-%m-%d %H:%M:%S')} [健康檢查] (等待 {int(wait_seconds)} 秒)")
+
                 time.sleep(wait_seconds)
 
-                # 執行監控與備份
+                # 執行任務
                 try:
-                    self.run()
+                    if is_backup_time:
+                        # 每 60 分鐘：執行完整的監控與備份
+                        self.run()
+                    else:
+                        # 每 10 分鐘：僅執行健康檢查
+                        self.logger.info("開始執行健康檢查")
+                        health_status = self.check_health()
+                        self.handle_health_change(health_status)
+                        self.logger.info("健康檢查結束")
+                        self.logger.info("=" * 50)
+
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
