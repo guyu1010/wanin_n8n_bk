@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import time
 
 
@@ -43,16 +44,30 @@ class N8nMonitor:
         self.max_retries = config.get('max_retries', 3)
 
     def setup_logging(self):
-        """設定日誌系統"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('n8n_monitor.log', encoding='utf-8'),
-                logging.StreamHandler()
-            ]
+        """設定日誌系統（自動輪替，保留 60 天）"""
+        # 建立 TimedRotatingFileHandler：每天輪替一次，保留 60 天
+        file_handler = TimedRotatingFileHandler(
+            filename='n8n_monitor.log',
+            when='midnight',          # 每天午夜輪替
+            interval=1,               # 每 1 天
+            backupCount=60,           # 保留 60 個備份檔（約 2 個月）
+            encoding='utf-8'
         )
+        file_handler.suffix = '%Y-%m-%d'  # 備份檔名格式：n8n_monitor.log.2024-01-15
+
+        # 設定日誌格式
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+
+        # 設定 logger
         self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
 
     # ========== 健康檢查 ==========
 
@@ -306,17 +321,17 @@ class N8nMonitor:
 
                 except subprocess.CalledProcessError as e:
                     if 'no upstream branch' in e.stderr:
-                        self._run_git_command(['git', 'push', '--set-upstream', 'origin', 'main'])
+                        self._run_git_command(['git', 'push', '--set-upstream', 'origin', 'master'])
                         return True
                     elif 'rejected' in e.stderr or 'fetch first' in e.stderr:
                         # 先 pull 再重試
                         try:
-                            self._run_git_command(['git', 'pull', '--no-rebase', '-X', 'theirs', 'origin', 'main'])
+                            self._run_git_command(['git', 'pull', '--no-rebase', '-X', 'theirs', 'origin', 'master'])
                             continue
                         except subprocess.CalledProcessError:
                             self.logger.warning("⚠️ Pull 失敗，重置到遠端狀態")
-                            self._run_git_command(['git', 'fetch', 'origin', 'main'])
-                            self._run_git_command(['git', 'reset', '--hard', 'origin/main'])
+                            self._run_git_command(['git', 'fetch', 'origin', 'master'])
+                            self._run_git_command(['git', 'reset', '--hard', 'origin/master'])
                             return False
                     elif retry < 2:
                         time.sleep(2 ** retry)

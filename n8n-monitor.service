@@ -4,11 +4,14 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/home/user/wanin_n8n_bk
-ExecStart=/usr/bin/python3 /home/user/wanin_n8n_bk/app.py
+User=wadmin
+WorkingDirectory=/home/wadmin/n8n/n8nbk_python
+ExecStart=/home/wadmin/n8n/n8nbk_python/venv/bin/python /home/wadmin/n8n/n8nbk_python/app.py
 Restart=always
 RestartSec=10
+
+# 環境變數
+Environment="PYTHONUNBUFFERED=1"
 
 # 日誌設定
 StandardOutput=journal
