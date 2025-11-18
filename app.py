@@ -279,6 +279,20 @@ class N8nMonitor:
 
         return filepath
 
+    def delete_workflow_file(self, workflow_id: str, workflow_name: str) -> bool:
+        """刪除本地的工作流程文件"""
+        try:
+            workflows_dir = self.git_repo_path / 'workflows'
+            # 查找匹配的文件（因為檔名包含 workflow_id）
+            for filepath in workflows_dir.glob(f"{workflow_id}_*.json"):
+                filepath.unlink()
+                self.logger.info(f"🗑️ 已刪除文件: {filepath.name}")
+                return True
+            return False
+        except Exception as e:
+            self.logger.error(f"✗ 刪除文件失敗: {e}")
+            return False
+
     # ========== Git 操作 ==========
 
     def _run_git_command(self, cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -292,7 +306,7 @@ class N8nMonitor:
             encoding='utf-8'
         )
 
-    def git_commit_and_push(self, changed_workflows: List[str]) -> bool:
+    def git_commit_and_push(self, changed_workflows: List[str], deleted_workflows: List[str] = None) -> bool:
         """提交變更到 Git"""
         try:
             # Git add
@@ -308,7 +322,19 @@ class N8nMonitor:
 
             # Commit
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            commit_msg = f"[自動備份] {timestamp}\n\n變更的工作流程:\n" + "\n".join(f"- {name}" for name in changed_workflows)
+            commit_msg_parts = [f"[自動備份] {timestamp}\n"]
+
+            if changed_workflows:
+                commit_msg_parts.append("變更的工作流程:")
+                commit_msg_parts.extend(f"- {name}" for name in changed_workflows)
+
+            if deleted_workflows:
+                if changed_workflows:
+                    commit_msg_parts.append("")  # 空行分隔
+                commit_msg_parts.append("刪除的工作流程:")
+                commit_msg_parts.extend(f"- {name}" for name in deleted_workflows)
+
+            commit_msg = "\n".join(commit_msg_parts)
 
             self._run_git_command(['git', 'commit', '-m', commit_msg])
 
@@ -354,8 +380,10 @@ class N8nMonitor:
         result = {
             'success': False,
             'changed_count': 0,
+            'deleted_count': 0,
             'total_count': 0,
             'changed_workflows': [],
+            'deleted_workflows': [],
             'workflow_changes': {},
             'error': None
         }
@@ -378,6 +406,7 @@ class N8nMonitor:
         new_hashes = {}
         new_workflows = {}
         changed_workflows = []
+        deleted_workflows = []
 
         # 處理每個工作流程
         for workflow in workflows:
@@ -412,6 +441,18 @@ class N8nMonitor:
                     self.save_workflow(detail)
                     changed_workflows.append(workflow_name)
 
+        # 檢測被刪除的工作流程
+        current_workflow_ids = {w['id'] for w in workflows}
+        for old_id, old_workflow_data in old_workflows.items():
+            if old_id not in current_workflow_ids:
+                workflow_name = old_workflow_data.get('name', 'Unknown')
+                self.logger.warning(f"🗑️ 工作流程已刪除: {workflow_name}")
+
+                # 刪除對應的文件
+                if self.delete_workflow_file(old_id, workflow_name):
+                    deleted_workflows.append(workflow_name)
+                    result['workflow_changes'][workflow_name] = "🗑️ 工作流程已刪除"
+
         # 儲存新的 hash 和資料
         with open(hash_file, 'w', encoding='utf-8') as f:
             json.dump(new_hashes, f, indent=2)
@@ -421,11 +462,13 @@ class N8nMonitor:
             json.dump(sanitized_workflows, f, indent=2, ensure_ascii=False)
 
         result['changed_count'] = len(changed_workflows)
+        result['deleted_count'] = len(deleted_workflows)
         result['changed_workflows'] = changed_workflows
+        result['deleted_workflows'] = deleted_workflows
 
         # 提交到 Git
-        if changed_workflows:
-            if self.git_commit_and_push(changed_workflows):
+        if changed_workflows or deleted_workflows:
+            if self.git_commit_and_push(changed_workflows, deleted_workflows):
                 result['success'] = True
             else:
                 result['error'] = 'Git 提交失敗'
@@ -504,15 +547,24 @@ class N8nMonitor:
             result = data['backup_result']
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+            facts = [
+                {"title": "⏰ 備份時間", "value": timestamp},
+                {"title": "📊 總流程數", "value": str(result.get('total_count', 0))},
+                {"title": "✏️ 本次變更", "value": str(result.get('changed_count', 0))}
+            ]
+
+            # 如果有刪除的工作流，也顯示刪除數量
+            if result.get('deleted_count', 0) > 0:
+                facts.append({"title": "🗑️ 本次刪除", "value": str(result.get('deleted_count', 0))})
+
             body.append({
                 "type": "FactSet",
-                "facts": [
-                    {"title": "⏰ 備份時間", "value": timestamp},
-                    {"title": "📊 總流程數", "value": str(result.get('total_count', 0))},
-                    {"title": "✏️ 本次變更", "value": str(result.get('changed_count', 0))}
-                ]
+                "facts": facts
             })
 
+            workflow_changes = result.get('workflow_changes', {})
+
+            # 顯示變更的工作流程
             if result.get('changed_workflows'):
                 body.append({
                     "type": "TextBlock",
@@ -521,7 +573,6 @@ class N8nMonitor:
                     "spacing": "Medium"
                 })
 
-                workflow_changes = result.get('workflow_changes', {})
                 for workflow_name in result['changed_workflows']:
                     body.append({
                         "type": "TextBlock",
@@ -541,6 +592,33 @@ class N8nMonitor:
                                     "isSubtle": True,
                                     "wrap": True
                                 })
+
+            # 顯示刪除的工作流程
+            if result.get('deleted_workflows'):
+                body.append({
+                    "type": "TextBlock",
+                    "text": "**刪除的工作流程：**",
+                    "weight": "Bolder",
+                    "spacing": "Medium",
+                    "color": "Attention"
+                })
+
+                for workflow_name in result['deleted_workflows']:
+                    body.append({
+                        "type": "TextBlock",
+                        "text": f"🗑️ **{workflow_name}**",
+                        "spacing": "Small",
+                        "weight": "Bolder",
+                        "color": "Attention"
+                    })
+                    body.append({
+                        "type": "TextBlock",
+                        "text": "  此工作流程已從 n8n 中刪除，備份文件已同步移除",
+                        "spacing": "None",
+                        "size": "Small",
+                        "isSubtle": True,
+                        "wrap": True
+                    })
 
             card["attachments"][0]["content"]["actions"] = [
                 {"type": "Action.OpenUrl", "title": "開啟 n8n", "url": self.n8n_url},
@@ -594,13 +672,22 @@ class N8nMonitor:
             self.logger.info("🔄 開始備份工作流程...")
             backup_result = self.backup_workflows()
 
-            if backup_result['changed_count'] > 0:
+            has_changes = backup_result['changed_count'] > 0 or backup_result['deleted_count'] > 0
+
+            if has_changes:
                 self.send_webhook_notification({
                     'title': 'n8n工作流程異動 - 備份完成',
                     'status': 'success',
                     'backup_result': backup_result
                 })
-                self.logger.info(f"✓ 備份完成 ({backup_result['changed_count']}/{backup_result['total_count']} 個變更)")
+
+                summary_parts = []
+                if backup_result['changed_count'] > 0:
+                    summary_parts.append(f"{backup_result['changed_count']} 個變更")
+                if backup_result['deleted_count'] > 0:
+                    summary_parts.append(f"{backup_result['deleted_count']} 個刪除")
+
+                self.logger.info(f"✓ 備份完成 ({', '.join(summary_parts)}/{backup_result['total_count']} 個工作流程)")
             else:
                 self.logger.info(f"✓ 無變更 (共 {backup_result['total_count']} 個工作流程)")
         else:
