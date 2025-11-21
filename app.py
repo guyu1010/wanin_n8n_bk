@@ -528,8 +528,8 @@ class N8nMonitor:
                                 })
 
             card["attachments"][0]["content"]["actions"] = [
-                {"type": "Action.OpenUrl", "title": "開啟 n8n", "url": self.n8n_url},
-                {"type": "Action.OpenUrl", "title": "查看備份", "url": self.git_remote_url}
+                {"type": "Action.OpenUrl", "title": "開啟 n8n", "url": "http://103.130.124.157:5678/home/workflows"},
+                {"type": "Action.OpenUrl", "title": "查看備份", "url": "http://192.168.12.29/RD4_Projects/tools/n8nbackup"}
             ]
 
         # 健康狀態通知
@@ -553,7 +553,7 @@ class N8nMonitor:
                 })
 
             card["attachments"][0]["content"]["actions"] = [
-                {"type": "Action.OpenUrl", "title": "檢查 n8n", "url": self.n8n_url}
+                {"type": "Action.OpenUrl", "title": "檢查 n8n", "url": "http://103.130.124.157:5678/home/workflows"}
             ]
 
         # 一般訊息
